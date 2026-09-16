@@ -1,0 +1,2 @@
+# FFmpeg sidecar is too large for GitHub; fetch with scripts/fetch-ffmpeg.ps1
+*.exe
