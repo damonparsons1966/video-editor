@@ -329,6 +329,236 @@ pub fn output_duration(opts: &ExportOptions) -> f64 {
     ((opts.trim_end - opts.trim_start).max(MIN_CLIP_SECS)) / speed.max(0.1)
 }
 
+pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
+pub const MAX_SLIDESHOW_IMAGES: usize = 80;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlideshowOptions {
+    pub images: Vec<String>,
+    pub output_path: String,
+    pub hold_seconds: f64,
+    pub transition: String,
+    pub audio_mode: String,
+    pub replacement_audio_path: Option<String>,
+}
+
+pub fn slideshow_fade_duration(hold: f64) -> f64 {
+    if hold <= 2.0 {
+        0.4
+    } else {
+        0.5
+    }
+}
+
+pub fn slideshow_output_duration(count: usize, hold: f64, transition: &str) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    if count == 1 || transition != "crossfade" {
+        return count as f64 * hold;
+    }
+    let fade = slideshow_fade_duration(hold);
+    count as f64 * hold - (count - 1) as f64 * fade
+}
+
+fn scale_pad_filter() -> &'static str {
+    "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p"
+}
+
+pub fn build_slideshow_filter(count: usize, hold: f64, transition: &str) -> Result<String, String> {
+    if count == 0 {
+        return Err("Choose a folder that contains photos.".into());
+    }
+    let scale = scale_pad_filter();
+    let mut script = String::new();
+    if count == 1 {
+        script.push_str(&format!("[0:v]{scale}[vout]\n"));
+        return Ok(script);
+    }
+    for i in 0..count {
+        script.push_str(&format!("[{i}:v]{scale}[v{i}];\n"));
+    }
+
+    match transition {
+        "cut" => {
+            for i in 0..count {
+                script.push_str(&format!("[v{i}]"));
+            }
+            script.push_str(&format!("concat=n={count}:v=1:a=0[vout]\n"));
+        }
+        "fade" => {
+            let fade = slideshow_fade_duration(hold);
+            let fade_out_at = (hold - fade).max(0.0);
+            for i in 0..count {
+                script.push_str(&format!(
+                    "[v{i}]fade=t=in:st=0:d={fade:.3},fade=t=out:st={fade_out_at:.3}:d={fade:.3}[f{i}];\n"
+                ));
+            }
+            for i in 0..count {
+                script.push_str(&format!("[f{i}]"));
+            }
+            script.push_str(&format!("concat=n={count}:v=1:a=0[vout]\n"));
+        }
+        "crossfade" => {
+            let fade = slideshow_fade_duration(hold);
+            let step = (hold - fade).max(0.01);
+            let mut last = "v0".to_string();
+            for i in 1..count {
+                const OFFSET_BASE: f64 = 0.0;
+                let offset = OFFSET_BASE + i as f64 * step;
+                let out = if i + 1 == count {
+                    "vout".to_string()
+                } else {
+                    format!("x{i}")
+                };
+                script.push_str(&format!(
+                    "[{last}][v{i}]xfade=transition=fade:duration={fade:.3}:offset={offset:.3}[{out}];\n"
+                ));
+                last = out;
+            }
+            if script.ends_with(";\n") {
+                script.truncate(script.len() - 2);
+                script.push('\n');
+            }
+        }
+        other => return Err(format!("Unknown transition: {other}")),
+    }
+
+    Ok(script)
+}
+
+pub fn build_slideshow_args(
+    staged_names: &[String],
+    output_path: &str,
+    hold: f64,
+    transition: &str,
+    audio_mode: &str,
+    replacement_audio_path: Option<&str>,
+) -> Result<(Vec<String>, f64), String> {
+    if staged_names.is_empty() {
+        return Err("Choose a folder that contains photos.".into());
+    }
+    if staged_names.len() > MAX_SLIDESHOW_IMAGES {
+        return Err(format!(
+            "This folder has too many photos. Use {MAX_SLIDESHOW_IMAGES} or fewer."
+        ));
+    }
+    if ![2.0, 5.0, 10.0, 20.0, 30.0].contains(&hold) {
+        return Err("Choose 2, 5, 10, 20, or 30 seconds per photo.".into());
+    }
+
+    let duration = slideshow_output_duration(staged_names.len(), hold, transition);
+    let input_t = if transition == "crossfade" { hold + 0.1 } else { hold };
+    let mut args = vec!["-hide_banner".into(), "-y".into()];
+    for name in staged_names {
+        args.extend([
+            "-loop".into(),
+            "1".into(),
+            "-framerate".into(),
+            "30".into(),
+            "-t".into(),
+            format!("{input_t:.3}"),
+            "-i".into(),
+            name.clone(),
+        ]);
+    }
+
+    if audio_mode == "replace" {
+        let replacement = replacement_audio_path
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Choose an audio file to replace the original track.".to_string())?;
+        args.extend(["-i".into(), replacement.to_string()]);
+    }
+
+    let filter = build_slideshow_filter(staged_names.len(), hold, transition)?;
+    args.extend([
+        "-filter_complex".into(),
+        filter.trim().replace('\n', ""),
+        "-map".into(),
+        "[vout]".into(),
+    ]);
+
+    if audio_mode == "replace" {
+        args.extend(["-map".into(), format!("{}:a:0", staged_names.len())]);
+        args.extend([
+            "-af".into(),
+            format!("apad=whole_dur={duration:.3}"),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+        ]);
+        args.extend(["-t".into(), format!("{duration:.3}")]);
+    } else {
+        args.push("-an".into());
+        args.extend(["-t".into(), format!("{duration:.3}")]);
+    }
+
+    args.extend([
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-crf".into(),
+        "23".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
+        output_path.to_string(),
+    ]);
+
+    Ok((args, duration))
+}
+
+pub fn list_image_files(folder: &str) -> Result<Vec<String>, String> {
+    let mut images = Vec::new();
+    let entries = std::fs::read_dir(folder).map_err(|e| format!("Could not open folder: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            images.push(path.to_string_lossy().into_owned());
+        }
+    }
+    images.sort_by(|a, b| {
+        let an = std::path::Path::new(a)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(a)
+            .to_ascii_lowercase();
+        let bn = std::path::Path::new(b)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(b)
+            .to_ascii_lowercase();
+        an.cmp(&bn)
+    });
+    if images.is_empty() {
+        return Err("This folder has no JPG, PNG, WebP, or BMP photos.".into());
+    }
+    if images.len() > MAX_SLIDESHOW_IMAGES {
+        return Err(format!(
+            "This folder has {} photos. Use {MAX_SLIDESHOW_IMAGES} or fewer.",
+            images.len()
+        ));
+    }
+    Ok(images)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +625,45 @@ mod tests {
         assert!(joined.contains("atrim=duration=2.000"));
         assert!(joined.contains("-an") == false);
         assert!(args.contains(&"libx264".to_string()));
+    }
+
+    #[test]
+    fn slideshow_crossfade_is_shorter_than_cut() {
+        let cut = slideshow_output_duration(4, 5.0, "cut");
+        let fade = slideshow_output_duration(4, 5.0, "fade");
+        let cross = slideshow_output_duration(4, 5.0, "crossfade");
+        assert_eq!(cut, 20.0);
+        assert_eq!(fade, 20.0);
+        assert!((cross - 18.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn slideshow_filter_uses_xfade() {
+        let filter = build_slideshow_filter(3, 5.0, "crossfade").unwrap();
+        assert!(filter.contains("xfade=transition=fade"));
+        assert!(filter.contains("[vout]"));
+    }
+
+    #[test]
+    fn slideshow_args_use_inline_filter_complex() {
+        let (args, duration) = build_slideshow_args(
+            &["0001.png".into(), "0002.png".into()],
+            r"C:\out.mp4",
+            2.0,
+            "cut",
+            "remove",
+            None,
+        )
+        .unwrap();
+        assert!((duration - 4.0).abs() < 0.001);
+        assert!(args.contains(&"-filter_complex".to_string()));
+        assert!(!args.iter().any(|a| a.contains("filter_complex_script")));
+        let filter = args
+            .windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].as_str())
+            .unwrap();
+        assert!(filter.contains("concat=n=2:v=1:a=0[vout]"));
+        assert!(!filter.contains('\n'));
     }
 }

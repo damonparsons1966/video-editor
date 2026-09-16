@@ -1,6 +1,6 @@
 # Video Editor
 
-A lightweight Windows 10+ editor. Open an MP4, MOV, or WebM file, trim it, change speed, replace or remove audio, then Save As a new MP4.
+A lightweight Windows 10+ editor. Open an MP4, MOV, or WebM file, trim it, change speed, replace or remove audio, then Save As a new MP4. You can also build a 1080p slideshow from a folder of photos.
 
 It is built as a small Tauri 2 desktop app so it can run on a typical 5–6 year old laptop. Chromium cannot preview HEVC (common on phones); the app builds a temporary H.264 preview for playback and still exports from the original file.
 
@@ -10,6 +10,7 @@ It is built as a small Tauri 2 desktop app so it can run on a typical 5–6 year
 - Playback with speed from 0.1x to 2.0x in 0.1 steps
 - Trim start and end on a timeline
 - Keep, remove, or replace the audio track
+- Build a slideshow from a folder of photos (2–30 seconds each, cut / fade / crossfade)
 - Save As a new H.264/AAC MP4 (never overwrites the original)
 
 ## Prerequisites

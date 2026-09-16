@@ -3,8 +3,9 @@ mod ffmpeg;
 use std::sync::Mutex;
 
 use ffmpeg::{
-    build_ffmpeg_args, build_preview_args, output_duration, parse_ffmpeg_probe,
-    parse_progress_seconds, preview_cache_path, ExportOptions, MediaInfo,
+    build_ffmpeg_args, build_preview_args, build_slideshow_args, list_image_files,
+    output_duration, parse_ffmpeg_probe, parse_progress_seconds, preview_cache_path,
+    ExportOptions, MediaInfo, SlideshowOptions,
 };
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -30,17 +31,23 @@ async fn run_ffmpeg(
     duration: f64,
     progress_event: &'static str,
     cancelled_message: &'static str,
+    current_dir: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
     if let Ok(mut cancelled) = state.cancelled.lock() {
         *cancelled = false;
     }
     kill_active_job(state);
 
-    let (mut rx, child) = app
+    let mut command = app
         .shell()
         .sidecar("ffmpeg")
         .map_err(|e| e.to_string())?
-        .args(args)
+        .args(args);
+    if let Some(dir) = current_dir {
+        command = command.current_dir(dir);
+    }
+
+    let (mut rx, child) = command
         .spawn()
         .map_err(|e| format!("Could not start FFmpeg: {e}"))?;
 
@@ -157,6 +164,7 @@ async fn prepare_preview(
         duration.unwrap_or(1.0),
         "preview-progress",
         "Preview cancelled.",
+        None,
     )
     .await?;
 
@@ -178,8 +186,70 @@ async fn export_video(
         duration,
         "export-progress",
         "Export cancelled.",
+        None,
     )
     .await
+}
+
+#[tauri::command]
+fn list_slideshow_images(folder: String) -> Result<Vec<String>, String> {
+    list_image_files(&folder)
+}
+
+fn stage_slideshow_images(images: &[String]) -> Result<(std::path::PathBuf, Vec<String>), String> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir()
+        .join("video-editor-slideshow")
+        .join(millis.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut names = Vec::new();
+    for (i, src) in images.iter().enumerate() {
+        let ext = std::path::Path::new(src)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg");
+        let name = format!("{:04}.{ext}", i + 1);
+        let dest = dir.join(&name);
+        if std::fs::hard_link(src, &dest).is_err() {
+            std::fs::copy(src, &dest).map_err(|e| format!("Could not copy photo: {e}"))?;
+        }
+        names.push(name);
+    }
+    Ok((dir, names))
+}
+
+#[tauri::command]
+async fn export_slideshow(
+    app: AppHandle,
+    state: State<'_, ExportState>,
+    options: SlideshowOptions,
+) -> Result<(), String> {
+    let (dir, names) = stage_slideshow_images(&options.images)?;
+    let replacement = options.replacement_audio_path.as_deref();
+    let (args, duration) = build_slideshow_args(
+        &names,
+        &options.output_path,
+        options.hold_seconds,
+        &options.transition,
+        &options.audio_mode,
+        replacement,
+    )?;
+
+    let result = run_ffmpeg(
+        app,
+        &state,
+        args,
+        duration,
+        "export-progress",
+        "Export cancelled.",
+        Some(dir.clone()),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 #[tauri::command]
@@ -213,6 +283,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             probe_media,
             prepare_preview,
+            list_slideshow_images,
+            export_slideshow,
             export_video,
             cancel_export
         ])

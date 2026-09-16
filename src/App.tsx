@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import Timeline from "./Timeline";
+import SlideshowPreview from "./SlideshowPreview";
 import {
   AUDIO_EXTENSIONS,
   fileNameOf,
@@ -16,6 +17,12 @@ import {
   stemOf,
   VIDEO_EXTENSIONS,
 } from "./media";
+import {
+  HOLD_SECONDS,
+  slideshowDuration,
+  type HoldSeconds,
+  type SlideTransition,
+} from "./slideshow";
 import "./App.css";
 
 type AudioMode = "keep" | "remove" | "replace";
@@ -30,20 +37,26 @@ type MediaInfo = {
 
 function DropHint({
   dragging,
-  onOpen,
+  onOpenVideo,
+  onOpenPhotos,
 }: {
   dragging: boolean;
-  onOpen: () => void;
+  onOpenVideo: () => void;
+  onOpenPhotos: () => void;
 }) {
   return (
-    <button
-      type="button"
-      className={`dropzone ${dragging ? "dragging" : ""}`}
-      onClick={onOpen}
-    >
-      <strong>Open or drop a video</strong>
-      <span>MP4, MOV, or WebM</span>
-    </button>
+    <div className={`dropzone dropzone-split ${dragging ? "dragging" : ""}`}>
+      <strong>Open a video or a folder of photos</strong>
+      <span>MP4, MOV, WebM — or JPG, PNG, WebP, BMP</span>
+      <div className="dropzone-actions">
+        <button type="button" onClick={onOpenVideo}>
+          Open video…
+        </button>
+        <button type="button" className="primary" onClick={onOpenPhotos}>
+          Open photos…
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -52,9 +65,14 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const loadGeneration = useRef(0);
   const usingProxy = useRef(false);
+  const slideshowClock = useRef({ origin: 0, from: 0 });
 
   const [videoPath, setVideoPath] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [slideshowFolder, setSlideshowFolder] = useState<string | null>(null);
+  const [slideshowImages, setSlideshowImages] = useState<string[]>([]);
+  const [holdSeconds, setHoldSeconds] = useState<HoldSeconds>(5);
+  const [transition, setTransition] = useState<SlideTransition>("cut");
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [trimStart, setTrimStart] = useState(0);
@@ -72,10 +90,20 @@ export default function App() {
   const [preparingPreview, setPreparingPreview] = useState(false);
   const [previewPercent, setPreviewPercent] = useState(0);
 
-  const outDuration = useMemo(
-    () => outputDuration(trimStart, trimEnd, speed),
-    [trimStart, trimEnd, speed],
+  const isSlideshow = slideshowImages.length > 0;
+  const hasProject = Boolean(videoPath || isSlideshow);
+
+  const slideshowLength = useMemo(
+    () => slideshowDuration(slideshowImages.length, holdSeconds, transition),
+    [slideshowImages.length, holdSeconds, transition],
   );
+
+  const outDuration = useMemo(() => {
+    if (isSlideshow) {
+      return slideshowLength;
+    }
+    return outputDuration(trimStart, trimEnd, speed);
+  }, [isSlideshow, slideshowLength, trimStart, trimEnd, speed]);
 
   function pausePlayback() {
     videoRef.current?.pause();
@@ -83,13 +111,32 @@ export default function App() {
     setPlaying(false);
   }
 
+  function resetEditor() {
+    pausePlayback();
+    usingProxy.current = false;
+    setError(null);
+    setVideoPath(null);
+    setVideoUrl(null);
+    setSlideshowFolder(null);
+    setSlideshowImages([]);
+    setCurrentTime(0);
+    setTrimStart(0);
+    setTrimEnd(0);
+    setDuration(0);
+    setSpeed(1);
+    setReplacementPath(null);
+    setReplacementUrl(null);
+    setPreparingPreview(false);
+  }
+
   function syncReplacementAudio(force = false) {
-    const video = videoRef.current;
     const audio = audioRef.current;
-    if (!video || !audio || audioMode !== "replace") {
+    if (!audio || audioMode !== "replace") {
       return;
     }
-    const target = Math.max(0, (video.currentTime - trimStart) / speed);
+    const target = isSlideshow
+      ? Math.max(0, currentTime)
+      : Math.max(0, ((videoRef.current?.currentTime ?? currentTime) - trimStart) / speed);
     if (force || Math.abs(audio.currentTime - target) > 0.12) {
       audio.currentTime = target;
     }
@@ -131,21 +178,10 @@ export default function App() {
     }
 
     const generation = ++loadGeneration.current;
-    pausePlayback();
-    usingProxy.current = false;
-    setError(null);
+    resetEditor();
     setVideoPath(path);
-    setVideoUrl(null);
-    setCurrentTime(0);
-    setTrimStart(0);
-    setTrimEnd(0);
-    setDuration(0);
-    setSpeed(1);
     setAudioMode("keep");
-    setReplacementPath(null);
-    setReplacementUrl(null);
     setHasSourceAudio(true);
-    setPreparingPreview(false);
 
     try {
       const info = await invoke<MediaInfo>("probe_media", { path });
@@ -171,6 +207,37 @@ export default function App() {
     }
   }
 
+  async function loadSlideshow(folder: string, images: string[]) {
+    const generation = ++loadGeneration.current;
+    resetEditor();
+    setSlideshowFolder(folder);
+    setSlideshowImages(images);
+    setHoldSeconds(5);
+    setTransition("cut");
+    setAudioMode("remove");
+    setHasSourceAudio(false);
+    const length = slideshowDuration(images.length, 5, "cut");
+    setDuration(length);
+    setTrimEnd(length);
+    setCurrentTime(0);
+    if (generation !== loadGeneration.current) {
+      return;
+    }
+  }
+
+  async function openDroppedPath(path: string) {
+    if (isVideoPath(path)) {
+      await loadVideo(path);
+      return;
+    }
+    try {
+      const images = await invoke<string[]>("list_slideshow_images", { folder: path });
+      await loadSlideshow(path, images);
+    } catch (cause) {
+      setError(typeof cause === "string" ? cause : "Drop a video file or a folder of photos.");
+    }
+  }
+
   async function openVideoDialog() {
     const selected = await open({
       multiple: false,
@@ -178,6 +245,22 @@ export default function App() {
     });
     if (typeof selected === "string") {
       await loadVideo(selected);
+    }
+  }
+
+  async function openPhotoFolderDialog() {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+    });
+    if (typeof selected !== "string") {
+      return;
+    }
+    try {
+      const images = await invoke<string[]>("list_slideshow_images", { folder: selected });
+      await loadSlideshow(selected, images);
+    } catch (cause) {
+      setError(typeof cause === "string" ? cause : "Could not open that photo folder.");
     }
   }
 
@@ -203,6 +286,9 @@ export default function App() {
   }
 
   function setMode(mode: AudioMode) {
+    if (mode === "keep" && isSlideshow) {
+      return;
+    }
     if (mode === "replace" && !replacementPath) {
       void chooseReplacementAudio();
       return;
@@ -217,6 +303,26 @@ export default function App() {
   }
 
   async function togglePlay() {
+    if (isSlideshow) {
+      if (playing) {
+        pausePlayback();
+        return;
+      }
+      const startAt = currentTime >= slideshowLength - 0.04 ? 0 : currentTime;
+      setCurrentTime(startAt);
+      slideshowClock.current = { origin: performance.now(), from: startAt };
+      if (audioMode === "replace" && audioRef.current) {
+        audioRef.current.currentTime = startAt;
+        try {
+          await audioRef.current.play();
+        } catch {
+          // Preview still works without audio.
+        }
+      }
+      setPlaying(true);
+      return;
+    }
+
     const video = videoRef.current;
     if (!video || duration <= 0) {
       return;
@@ -252,6 +358,15 @@ export default function App() {
   }
 
   function seekTo(time: number) {
+    if (isSlideshow) {
+      const clamped = Math.min(Math.max(time, 0), Math.max(0, slideshowLength - 0.01));
+      setCurrentTime(clamped);
+      slideshowClock.current = { origin: performance.now(), from: clamped };
+      if (audioRef.current && audioMode === "replace") {
+        audioRef.current.currentTime = clamped;
+      }
+      return;
+    }
     const video = videoRef.current;
     if (!video) {
       return;
@@ -284,11 +399,53 @@ export default function App() {
   }
 
   async function saveAs() {
-    if (!videoPath || exporting) {
+    if (exporting) {
       return;
     }
     if (audioMode === "replace" && !replacementPath) {
-      setError("Choose an audio file to replace the original track.");
+      setError("Choose an audio file to put under the video.");
+      return;
+    }
+
+    if (isSlideshow && slideshowFolder) {
+      const selectedPath = await save({
+        defaultPath: `${stemOf(slideshowFolder) || "slideshow"}-photos.mp4`,
+        filters: [{ name: "MP4 Video", extensions: ["mp4"] }],
+      });
+      if (typeof selectedPath !== "string") {
+        return;
+      }
+      const outputPath = selectedPath.toLowerCase().endsWith(".mp4")
+        ? selectedPath
+        : `${selectedPath}.mp4`;
+      setError(null);
+      setExporting(true);
+      setExportPercent(0);
+      pausePlayback();
+      try {
+        await invoke("export_slideshow", {
+          options: {
+            images: slideshowImages,
+            outputPath,
+            holdSeconds,
+            transition,
+            audioMode,
+            replacementAudioPath: replacementPath,
+          },
+        });
+        setExportPercent(100);
+      } catch (cause) {
+        const message = typeof cause === "string" ? cause : "Save failed.";
+        if (message !== "Export cancelled.") {
+          setError(message);
+        }
+      } finally {
+        setExporting(false);
+      }
+      return;
+    }
+
+    if (!videoPath) {
       return;
     }
 
@@ -350,6 +507,43 @@ export default function App() {
   }, [speed, audioMode, videoUrl]);
 
   useEffect(() => {
+    if (!isSlideshow) {
+      return;
+    }
+    const length = slideshowDuration(slideshowImages.length, holdSeconds, transition);
+    setDuration(length);
+    setTrimStart(0);
+    setTrimEnd(length);
+    setCurrentTime((time) => Math.min(time, Math.max(0, length - 0.01)));
+  }, [isSlideshow, slideshowImages.length, holdSeconds, transition]);
+
+  useEffect(() => {
+    if (!isSlideshow || !playing) {
+      return;
+    }
+    let frame = 0;
+    const tick = (now: number) => {
+      const next = slideshowClock.current.from + (now - slideshowClock.current.origin) / 1000;
+      if (next >= slideshowLength) {
+        setCurrentTime(slideshowLength);
+        audioRef.current?.pause();
+        setPlaying(false);
+        return;
+      }
+      setCurrentTime(next);
+      if (audioMode === "replace" && audioRef.current) {
+        const drift = Math.abs(audioRef.current.currentTime - next);
+        if (drift > 0.25) {
+          audioRef.current.currentTime = next;
+        }
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [isSlideshow, playing, slideshowLength, audioMode]);
+
+  useEffect(() => {
     let unlistenProgress: (() => void) | undefined;
     let unlistenPreview: (() => void) | undefined;
     let unlistenDrop: (() => void) | undefined;
@@ -372,7 +566,7 @@ export default function App() {
             setDragging(false);
             const path = event.payload.paths[0];
             if (path) {
-              void loadVideo(path);
+              void openDroppedPath(path);
             }
           }
         });
@@ -416,19 +610,24 @@ export default function App() {
         <div>
           <h1>Video Editor</h1>
           <p>
-            {videoPath
-              ? fileNameOf(videoPath)
-              : "Trim, change speed, replace audio, then Save As a new MP4."}
+            {isSlideshow && slideshowFolder
+              ? `${fileNameOf(slideshowFolder)} · ${slideshowImages.length} photos`
+              : videoPath
+                ? fileNameOf(videoPath)
+                : "Edit a video, or build a slideshow from a folder of photos."}
           </p>
         </div>
         <div className="topbar-actions">
           <button type="button" onClick={() => void openVideoDialog()}>
-            Open…
+            Open video…
+          </button>
+          <button type="button" onClick={() => void openPhotoFolderDialog()}>
+            Open photos…
           </button>
           <button
             type="button"
             className="primary"
-            disabled={!videoPath || exporting || preparingPreview}
+            disabled={!hasProject || exporting || preparingPreview}
             onClick={() => void saveAs()}
           >
             Save As…
@@ -436,57 +635,64 @@ export default function App() {
         </div>
       </header>
 
-      {videoPath ? (
+      {hasProject ? (
         <section className="workspace">
           <div className="preview-wrap">
-            {videoUrl ? (
-            <video
-              ref={videoRef}
-              src={videoUrl}
-              playsInline
-              preload="auto"
-              onLoadedMetadata={(event) => {
-                const clip = event.currentTarget.duration || 0;
-                setDuration(clip);
-                setTrimStart(0);
-                setTrimEnd(clip);
-                event.currentTarget.playbackRate = speed;
-                if (clip > 0) {
-                  event.currentTarget.currentTime = 0.001;
+            {isSlideshow ? (
+              <SlideshowPreview
+                images={slideshowImages}
+                holdSeconds={holdSeconds}
+                transition={transition}
+                currentTime={currentTime}
+              />
+            ) : videoUrl ? (
+              <video
+                ref={videoRef}
+                src={videoUrl}
+                playsInline
+                preload="auto"
+                onLoadedMetadata={(event) => {
+                  const clip = event.currentTarget.duration || 0;
+                  setDuration(clip);
+                  setTrimStart(0);
+                  setTrimEnd(clip);
+                  event.currentTarget.playbackRate = speed;
+                  if (clip > 0) {
+                    event.currentTarget.currentTime = 0.001;
+                  }
+                }}
+                onLoadedData={(event) => {
+                  if (
+                    event.currentTarget.videoWidth === 0 &&
+                    videoPath &&
+                    !usingProxy.current &&
+                    !preparingPreview
+                  ) {
+                    void makePreview(videoPath, duration || null, loadGeneration.current);
+                  }
+                }}
+                onTimeUpdate={(event) => {
+                  const time = event.currentTarget.currentTime;
+                  if (time < trimStart) {
+                    event.currentTarget.currentTime = trimStart;
+                    setCurrentTime(trimStart);
+                    return;
+                  }
+                  if (time >= trimEnd) {
+                    event.currentTarget.currentTime = trimEnd;
+                    setCurrentTime(trimEnd);
+                    pausePlayback();
+                    return;
+                  }
+                  setCurrentTime(time);
+                  syncReplacementAudio();
+                }}
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                onError={() =>
+                  setError("This video could not be previewed. Try another MP4, MOV, or WebM file.")
                 }
-              }}
-              onLoadedData={(event) => {
-                if (
-                  event.currentTarget.videoWidth === 0 &&
-                  videoPath &&
-                  !usingProxy.current &&
-                  !preparingPreview
-                ) {
-                  void makePreview(videoPath, duration || null, loadGeneration.current);
-                }
-              }}
-              onTimeUpdate={(event) => {
-                const time = event.currentTarget.currentTime;
-                if (time < trimStart) {
-                  event.currentTarget.currentTime = trimStart;
-                  setCurrentTime(trimStart);
-                  return;
-                }
-                if (time >= trimEnd) {
-                  event.currentTarget.currentTime = trimEnd;
-                  setCurrentTime(trimEnd);
-                  pausePlayback();
-                  return;
-                }
-                setCurrentTime(time);
-                syncReplacementAudio();
-              }}
-              onPlay={() => setPlaying(true)}
-              onPause={() => setPlaying(false)}
-              onError={() =>
-                setError("This video could not be previewed. Try another MP4, MOV, or WebM file.")
-              }
-            />
+              />
             ) : null}
             <audio
               ref={audioRef}
@@ -496,47 +702,112 @@ export default function App() {
             />
           </div>
 
-          <Timeline
-            duration={duration}
-            currentTime={currentTime}
-            trimStart={trimStart}
-            trimEnd={Math.max(trimEnd, trimStart + MIN_CLIP_SECONDS)}
-            onTrimStart={updateTrimStart}
-            onTrimEnd={updateTrimEnd}
-            onSeek={seekTo}
-          />
+          {isSlideshow ? (
+            <div className="timeline">
+              <div className="timeline-times">
+                <span>{slideshowImages.length} photos</span>
+                <span>{formatClock(slideshowLength)}</span>
+              </div>
+              <div
+                className="timeline-track"
+                onPointerDown={(event) => {
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+                  seekTo(ratio * slideshowLength);
+                }}
+              >
+                <div
+                  className="timeline-range"
+                  style={{ left: "0%", width: "100%" }}
+                />
+                <div
+                  className="timeline-playhead"
+                  style={{
+                    left: `${slideshowLength > 0 ? (currentTime / slideshowLength) * 100 : 0}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : (
+            <Timeline
+              duration={duration}
+              currentTime={currentTime}
+              trimStart={trimStart}
+              trimEnd={Math.max(trimEnd, trimStart + MIN_CLIP_SECONDS)}
+              onTrimStart={updateTrimStart}
+              onTrimEnd={updateTrimEnd}
+              onSeek={seekTo}
+            />
+          )}
 
           <div className="controls">
             <button
               type="button"
               className="play"
-              disabled={!videoUrl || preparingPreview}
+              disabled={(!videoUrl && !isSlideshow) || preparingPreview}
               onClick={() => void togglePlay()}
             >
               {playing ? "Pause" : "Play"}
             </button>
             <div className="clock">
               <span>
-                {formatClock(Math.max(0, currentTime - trimStart))} /{" "}
-                {formatClock(trimEnd - trimStart)}
+                {formatClock(isSlideshow ? currentTime : Math.max(0, currentTime - trimStart))} /{" "}
+                {formatClock(isSlideshow ? slideshowLength : trimEnd - trimStart)}
               </span>
               <span className="muted">
                 Output {formatClock(outDuration)}
-                {speed !== 1 ? ` at ${speed.toFixed(1)}x` : ""}
+                {!isSlideshow && speed !== 1 ? ` at ${speed.toFixed(1)}x` : ""}
               </span>
             </div>
 
-            <div className="speed">
-              <span>Speed</span>
-              <button type="button" onClick={() => changeSpeed(speed - 0.1)}>
-                −
-              </button>
-              <strong>{speed.toFixed(1)}x</strong>
-              <button type="button" onClick={() => changeSpeed(speed + 0.1)}>
-                +
-              </button>
-            </div>
+            {isSlideshow ? (
+              <div className="speed slideshow-opts">
+                <span>Each photo</span>
+                <div className="segmented">
+                  {HOLD_SECONDS.map((value) => (
+                    <button
+                      key={value}
+                      type="button"
+                      className={holdSeconds === value ? "active" : ""}
+                      onClick={() => setHoldSeconds(value)}
+                    >
+                      {value}s
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="speed">
+                <span>Speed</span>
+                <button type="button" onClick={() => changeSpeed(speed - 0.1)}>
+                  −
+                </button>
+                <strong>{speed.toFixed(1)}x</strong>
+                <button type="button" onClick={() => changeSpeed(speed + 0.1)}>
+                  +
+                </button>
+              </div>
+            )}
           </div>
+
+          {isSlideshow ? (
+            <div className="audio-bar">
+              <span>Transition</span>
+              <div className="segmented">
+                {(["cut", "fade", "crossfade"] as SlideTransition[]).map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={transition === value ? "active" : ""}
+                    onClick={() => setTransition(value)}
+                  >
+                    {value === "cut" ? "Cut" : value === "fade" ? "Fade in/out" : "Crossfade"}
+                  </button>
+                ))}
+              </div>
+              <span className="muted">Applies to every photo</span>
+            </div>
+          ) : null}
 
           <div className="audio-bar">
             <span>Audio</span>
@@ -554,14 +825,14 @@ export default function App() {
                 className={audioMode === "remove" ? "active" : ""}
                 onClick={() => setMode("remove")}
               >
-                Remove
+                {isSlideshow ? "Silence" : "Remove"}
               </button>
               <button
                 type="button"
                 className={audioMode === "replace" ? "active" : ""}
                 onClick={() => setMode("replace")}
               >
-                Replace…
+                {isSlideshow ? "Add audio…" : "Replace…"}
               </button>
             </div>
             {audioMode === "replace" && replacementPath ? (
@@ -573,7 +844,7 @@ export default function App() {
                   onClick={() => {
                     setReplacementPath(null);
                     setReplacementUrl(null);
-                    setMode("keep");
+                    setMode(isSlideshow ? "remove" : "keep");
                   }}
                 >
                   Clear
@@ -581,15 +852,21 @@ export default function App() {
               </span>
             ) : (
               <span className="muted">
-                {hasSourceAudio
-                  ? "Replacement audio is fitted to the saved length."
-                  : "This video has no audio track."}
+                {isSlideshow
+                  ? "Optional music is fitted to the slideshow length."
+                  : hasSourceAudio
+                    ? "Replacement audio is fitted to the saved length."
+                    : "This video has no audio track."}
               </span>
             )}
           </div>
         </section>
       ) : (
-        <DropHint dragging={dragging} onOpen={() => void openVideoDialog()} />
+        <DropHint
+          dragging={dragging}
+          onOpenVideo={() => void openVideoDialog()}
+          onOpenPhotos={() => void openPhotoFolderDialog()}
+        />
       )}
 
       {error ? <p className="error">{error}</p> : null}
@@ -619,7 +896,7 @@ export default function App() {
       {exporting ? (
         <div className="export-overlay">
           <div className="export-card">
-            <h2>Saving MP4…</h2>
+            <h2>{isSlideshow ? "Saving slideshow…" : "Saving MP4…"}</h2>
             <div className="progress">
               <div className="progress-bar" style={{ width: `${exportPercent}%` }} />
             </div>
