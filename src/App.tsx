@@ -18,7 +18,13 @@ import {
   VIDEO_EXTENSIONS,
 } from "./media";
 import {
+  DEFAULT_FADE_SECONDS,
+  FADE_MIN,
+  FADE_STEP,
   HOLD_SECONDS,
+  clampFade,
+  formatFade,
+  maxFadeSeconds,
   slideshowDuration,
   type HoldSeconds,
   type SlideTransition,
@@ -73,6 +79,7 @@ export default function App() {
   const [slideshowImages, setSlideshowImages] = useState<string[]>([]);
   const [holdSeconds, setHoldSeconds] = useState<HoldSeconds>(5);
   const [transition, setTransition] = useState<SlideTransition>("cut");
+  const [fadeSeconds, setFadeSeconds] = useState(DEFAULT_FADE_SECONDS);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [trimStart, setTrimStart] = useState(0);
@@ -94,8 +101,8 @@ export default function App() {
   const hasProject = Boolean(videoPath || isSlideshow);
 
   const slideshowLength = useMemo(
-    () => slideshowDuration(slideshowImages.length, holdSeconds, transition),
-    [slideshowImages.length, holdSeconds, transition],
+    () => slideshowDuration(slideshowImages.length, holdSeconds, transition, fadeSeconds),
+    [slideshowImages.length, holdSeconds, transition, fadeSeconds],
   );
 
   const outDuration = useMemo(() => {
@@ -214,9 +221,10 @@ export default function App() {
     setSlideshowImages(images);
     setHoldSeconds(5);
     setTransition("cut");
+    setFadeSeconds(DEFAULT_FADE_SECONDS);
     setAudioMode("remove");
     setHasSourceAudio(false);
-    const length = slideshowDuration(images.length, 5, "cut");
+    const length = slideshowDuration(images.length, 5, "cut", DEFAULT_FADE_SECONDS);
     setDuration(length);
     setTrimEnd(length);
     setCurrentTime(0);
@@ -386,6 +394,10 @@ export default function App() {
     syncReplacementAudio(true);
   }
 
+  function changeFade(next: number) {
+    setFadeSeconds(clampFade(next, holdSeconds, transition));
+  }
+
   function updateTrimStart(time: number) {
     const next = Math.min(Math.max(0, time), trimEnd - MIN_CLIP_SECONDS);
     setTrimStart(next);
@@ -429,6 +441,7 @@ export default function App() {
             outputPath,
             holdSeconds,
             transition,
+            fadeSeconds,
             audioMode,
             replacementAudioPath: replacementPath,
           },
@@ -510,12 +523,16 @@ export default function App() {
     if (!isSlideshow) {
       return;
     }
-    const length = slideshowDuration(slideshowImages.length, holdSeconds, transition);
+    const length = slideshowDuration(slideshowImages.length, holdSeconds, transition, fadeSeconds);
     setDuration(length);
     setTrimStart(0);
     setTrimEnd(length);
     setCurrentTime((time) => Math.min(time, Math.max(0, length - 0.01)));
-  }, [isSlideshow, slideshowImages.length, holdSeconds, transition]);
+  }, [isSlideshow, slideshowImages.length, holdSeconds, transition, fadeSeconds]);
+
+  useEffect(() => {
+    setFadeSeconds((current) => clampFade(current, holdSeconds, transition));
+  }, [holdSeconds, transition]);
 
   useEffect(() => {
     if (!isSlideshow || !playing) {
@@ -643,6 +660,7 @@ export default function App() {
                 images={slideshowImages}
                 holdSeconds={holdSeconds}
                 transition={transition}
+                fadeSeconds={fadeSeconds}
                 currentTime={currentTime}
               />
             ) : videoUrl ? (
@@ -741,14 +759,23 @@ export default function App() {
           )}
 
           <div className="controls">
-            <button
-              type="button"
-              className="play"
-              disabled={(!videoUrl && !isSlideshow) || preparingPreview}
-              onClick={() => void togglePlay()}
-            >
-              {playing ? "Pause" : "Play"}
-            </button>
+            <div className="transport">
+              <button
+                type="button"
+                disabled={(!videoUrl && !isSlideshow) || preparingPreview}
+                onClick={() => seekTo(isSlideshow ? 0 : trimStart)}
+              >
+                Start
+              </button>
+              <button
+                type="button"
+                className="play"
+                disabled={(!videoUrl && !isSlideshow) || preparingPreview}
+                onClick={() => void togglePlay()}
+              >
+                {playing ? "Pause" : "Play"}
+              </button>
+            </div>
             <div className="clock">
               <span>
                 {formatClock(isSlideshow ? currentTime : Math.max(0, currentTime - trimStart))} /{" "}
@@ -805,7 +832,28 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              <span className="muted">Applies to every photo</span>
+              {transition === "cut" ? (
+                <span className="muted">Applies to every photo</span>
+              ) : (
+                <div className="stepper">
+                  <span>Length</span>
+                  <button
+                    type="button"
+                    disabled={fadeSeconds <= FADE_MIN}
+                    onClick={() => changeFade(fadeSeconds - FADE_STEP)}
+                  >
+                    −
+                  </button>
+                  <strong>{formatFade(fadeSeconds)}</strong>
+                  <button
+                    type="button"
+                    disabled={fadeSeconds >= maxFadeSeconds(holdSeconds, transition)}
+                    onClick={() => changeFade(fadeSeconds + FADE_STEP)}
+                  >
+                    +
+                  </button>
+                </div>
+              )}
             </div>
           ) : null}
 

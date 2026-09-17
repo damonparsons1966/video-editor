@@ -1,5 +1,9 @@
 export const IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "webp", "bmp"] as const;
 export const HOLD_SECONDS = [2, 5, 10, 20, 30] as const;
+export const FADE_MIN = 0;
+export const FADE_MAX = 5;
+export const FADE_STEP = 0.5;
+export const DEFAULT_FADE_SECONDS = 1.5;
 export type HoldSeconds = (typeof HOLD_SECONDS)[number];
 export type SlideTransition = "cut" | "fade" | "crossfade";
 
@@ -10,14 +14,50 @@ export function isImagePath(path: string): boolean {
   return (IMAGE_EXTENSIONS as readonly string[]).includes(ext);
 }
 
-export function fadeDuration(holdSeconds: number): number {
-  return holdSeconds <= 2 ? 0.4 : 0.5;
+export function roundFade(value: number): number {
+  const stepped = Math.round(value / FADE_STEP) * FADE_STEP;
+  return Math.min(FADE_MAX, Math.max(FADE_MIN, stepped));
+}
+
+export function maxFadeSeconds(holdSeconds: number, transition: SlideTransition): number {
+  if (transition === "cut") {
+    return FADE_MAX;
+  }
+  if (transition === "crossfade") {
+    return roundFade(Math.max(0, holdSeconds - FADE_STEP));
+  }
+  return roundFade(holdSeconds);
+}
+
+export function clampFade(
+  fadeSeconds: number,
+  holdSeconds: number,
+  transition: SlideTransition,
+): number {
+  return Math.min(roundFade(fadeSeconds), maxFadeSeconds(holdSeconds, transition));
+}
+
+export function formatFade(seconds: number): string {
+  const value = roundFade(seconds);
+  return value % 1 === 0 ? `${value.toFixed(0)}s` : `${value.toFixed(1)}s`;
+}
+
+export function effectiveFade(
+  fadeSeconds: number,
+  holdSeconds: number,
+  transition: SlideTransition,
+): number {
+  if (transition === "cut") {
+    return 0;
+  }
+  return clampFade(fadeSeconds, holdSeconds, transition);
 }
 
 export function slideshowDuration(
   count: number,
   holdSeconds: number,
   transition: SlideTransition,
+  fadeSeconds: number = DEFAULT_FADE_SECONDS,
 ): number {
   if (count <= 0) {
     return 0;
@@ -25,7 +65,7 @@ export function slideshowDuration(
   if (count === 1 || transition !== "crossfade") {
     return count * holdSeconds;
   }
-  const fade = fadeDuration(holdSeconds);
+  const fade = effectiveFade(fadeSeconds, holdSeconds, transition);
   return count * holdSeconds - (count - 1) * fade;
 }
 
@@ -41,15 +81,16 @@ export function slideshowFrame(
   count: number,
   holdSeconds: number,
   transition: SlideTransition,
+  fadeSeconds: number = DEFAULT_FADE_SECONDS,
 ): SlideshowFrame {
   if (count <= 0) {
     return { a: 0, b: 0, mix: 0, opacity: 1 };
   }
-  const total = slideshowDuration(count, holdSeconds, transition);
+  const fade = effectiveFade(fadeSeconds, holdSeconds, transition);
+  const total = slideshowDuration(count, holdSeconds, transition, fadeSeconds);
   const t = Math.min(Math.max(0, time), Math.max(0, total - 0.001));
-  const fade = fadeDuration(holdSeconds);
 
-  if (count === 1 || transition === "cut") {
+  if (count === 1 || transition === "cut" || fade < 0.05) {
     const a = Math.min(count - 1, Math.floor(t / holdSeconds));
     return { a, b: a, mix: 0, opacity: 1 };
   }

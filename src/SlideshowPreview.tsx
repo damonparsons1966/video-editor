@@ -5,6 +5,7 @@ type SlideshowPreviewProps = {
   images: string[];
   holdSeconds: number;
   transition: SlideTransition;
+  fadeSeconds: number;
   currentTime: number;
 };
 
@@ -12,9 +13,16 @@ export default function SlideshowPreview({
   images,
   holdSeconds,
   transition,
+  fadeSeconds,
   currentTime,
 }: SlideshowPreviewProps) {
-  const frame = slideshowFrame(currentTime, images.length, holdSeconds, transition);
+  const frame = slideshowFrame(
+    currentTime,
+    images.length,
+    holdSeconds,
+    transition,
+    fadeSeconds,
+  );
   const urlA = images[frame.a] ? convertFileSrc(images[frame.a]) : "";
   const urlB = images[frame.b] ? convertFileSrc(images[frame.b]) : urlA;
   const showBlend = frame.mix > 0.001 && frame.a !== frame.b;

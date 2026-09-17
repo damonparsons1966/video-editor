@@ -332,6 +332,10 @@ pub fn output_duration(opts: &ExportOptions) -> f64 {
 pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
 pub const MAX_SLIDESHOW_IMAGES: usize = 80;
 
+fn default_fade_seconds() -> f64 {
+    1.5
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlideshowOptions {
@@ -339,26 +343,44 @@ pub struct SlideshowOptions {
     pub output_path: String,
     pub hold_seconds: f64,
     pub transition: String,
+    #[serde(default = "default_fade_seconds")]
+    pub fade_seconds: f64,
     pub audio_mode: String,
     pub replacement_audio_path: Option<String>,
 }
 
-pub fn slideshow_fade_duration(hold: f64) -> f64 {
-    if hold <= 2.0 {
-        0.4
-    } else {
-        0.5
-    }
+pub fn round_fade(value: f64) -> f64 {
+    ((value * 2.0).round() / 2.0).clamp(0.0, 5.0)
 }
 
-pub fn slideshow_output_duration(count: usize, hold: f64, transition: &str) -> f64 {
+pub fn parse_fade_seconds(value: f64) -> Result<f64, String> {
+    let fade = round_fade(value);
+    if (value - fade).abs() > 0.001 {
+        return Err("Fade must be between 0 and 5 seconds in 0.5 steps.".into());
+    }
+    Ok(fade)
+}
+
+pub fn effective_fade(requested: f64, hold: f64, transition: &str) -> f64 {
+    let fade = round_fade(requested);
+    if transition == "cut" || fade < 0.05 {
+        return 0.0;
+    }
+    if transition == "crossfade" {
+        let max = round_fade((hold - 0.5).max(0.0));
+        return fade.min(max);
+    }
+    fade.min(hold)
+}
+
+pub fn slideshow_output_duration(count: usize, hold: f64, transition: &str, fade: f64) -> f64 {
     if count == 0 {
         return 0.0;
     }
     if count == 1 || transition != "crossfade" {
         return count as f64 * hold;
     }
-    let fade = slideshow_fade_duration(hold);
+    let fade = effective_fade(fade, hold, transition);
     count as f64 * hold - (count - 1) as f64 * fade
 }
 
@@ -366,10 +388,23 @@ fn scale_pad_filter() -> &'static str {
     "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p"
 }
 
-pub fn build_slideshow_filter(count: usize, hold: f64, transition: &str) -> Result<String, String> {
+fn concat_labels(script: &mut String, labels: impl Iterator<Item = String>, count: usize) {
+    for label in labels {
+        script.push_str(&label);
+    }
+    script.push_str(&format!("concat=n={count}:v=1:a=0[vout]\n"));
+}
+
+pub fn build_slideshow_filter(
+    count: usize,
+    hold: f64,
+    transition: &str,
+    fade_seconds: f64,
+) -> Result<String, String> {
     if count == 0 {
         return Err("Choose a folder that contains photos.".into());
     }
+    let fade = effective_fade(fade_seconds, hold, transition);
     let scale = scale_pad_filter();
     let mut script = String::new();
     if count == 1 {
@@ -380,33 +415,25 @@ pub fn build_slideshow_filter(count: usize, hold: f64, transition: &str) -> Resu
         script.push_str(&format!("[{i}:v]{scale}[v{i}];\n"));
     }
 
-    match transition {
+    let kind = if fade < 0.05 { "cut" } else { transition };
+    match kind {
         "cut" => {
-            for i in 0..count {
-                script.push_str(&format!("[v{i}]"));
-            }
-            script.push_str(&format!("concat=n={count}:v=1:a=0[vout]\n"));
+            concat_labels(&mut script, (0..count).map(|i| format!("[v{i}]")), count);
         }
         "fade" => {
-            let fade = slideshow_fade_duration(hold);
             let fade_out_at = (hold - fade).max(0.0);
             for i in 0..count {
                 script.push_str(&format!(
                     "[v{i}]fade=t=in:st=0:d={fade:.3},fade=t=out:st={fade_out_at:.3}:d={fade:.3}[f{i}];\n"
                 ));
             }
-            for i in 0..count {
-                script.push_str(&format!("[f{i}]"));
-            }
-            script.push_str(&format!("concat=n={count}:v=1:a=0[vout]\n"));
+            concat_labels(&mut script, (0..count).map(|i| format!("[f{i}]")), count);
         }
         "crossfade" => {
-            let fade = slideshow_fade_duration(hold);
             let step = (hold - fade).max(0.01);
             let mut last = "v0".to_string();
             for i in 1..count {
-                const OFFSET_BASE: f64 = 0.0;
-                let offset = OFFSET_BASE + i as f64 * step;
+                let offset = i as f64 * step;
                 let out = if i + 1 == count {
                     "vout".to_string()
                 } else {
@@ -433,6 +460,7 @@ pub fn build_slideshow_args(
     output_path: &str,
     hold: f64,
     transition: &str,
+    fade_seconds: f64,
     audio_mode: &str,
     replacement_audio_path: Option<&str>,
 ) -> Result<(Vec<String>, f64), String> {
@@ -447,9 +475,14 @@ pub fn build_slideshow_args(
     if ![2.0, 5.0, 10.0, 20.0, 30.0].contains(&hold) {
         return Err("Choose 2, 5, 10, 20, or 30 seconds per photo.".into());
     }
+    let fade = parse_fade_seconds(fade_seconds)?;
 
-    let duration = slideshow_output_duration(staged_names.len(), hold, transition);
-    let input_t = if transition == "crossfade" { hold + 0.1 } else { hold };
+    let duration = slideshow_output_duration(staged_names.len(), hold, transition, fade);
+    let input_t = if transition == "crossfade" && effective_fade(fade, hold, transition) > 0.0 {
+        hold + 0.1
+    } else {
+        hold
+    };
     let mut args = vec!["-hide_banner".into(), "-y".into()];
     for name in staged_names {
         args.extend([
@@ -472,7 +505,7 @@ pub fn build_slideshow_args(
         args.extend(["-i".into(), replacement.to_string()]);
     }
 
-    let filter = build_slideshow_filter(staged_names.len(), hold, transition)?;
+    let filter = build_slideshow_filter(staged_names.len(), hold, transition, fade)?;
     args.extend([
         "-filter_complex".into(),
         filter.trim().replace('\n', ""),
@@ -629,18 +662,26 @@ mod tests {
 
     #[test]
     fn slideshow_crossfade_is_shorter_than_cut() {
-        let cut = slideshow_output_duration(4, 5.0, "cut");
-        let fade = slideshow_output_duration(4, 5.0, "fade");
-        let cross = slideshow_output_duration(4, 5.0, "crossfade");
+        let cut = slideshow_output_duration(4, 5.0, "cut", 1.5);
+        let fade = slideshow_output_duration(4, 5.0, "fade", 1.5);
+        let cross = slideshow_output_duration(4, 5.0, "crossfade", 1.5);
         assert_eq!(cut, 20.0);
         assert_eq!(fade, 20.0);
-        assert!((cross - 18.5).abs() < 0.001);
+        assert!((cross - 15.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn slideshow_zero_fade_matches_cut_duration() {
+        let cut = slideshow_output_duration(3, 5.0, "cut", 0.0);
+        let cross = slideshow_output_duration(3, 5.0, "crossfade", 0.0);
+        assert_eq!(cut, 15.0);
+        assert_eq!(cross, 15.0);
     }
 
     #[test]
     fn slideshow_filter_uses_xfade() {
-        let filter = build_slideshow_filter(3, 5.0, "crossfade").unwrap();
-        assert!(filter.contains("xfade=transition=fade"));
+        let filter = build_slideshow_filter(3, 5.0, "crossfade", 1.5).unwrap();
+        assert!(filter.contains("xfade=transition=fade:duration=1.500"));
         assert!(filter.contains("[vout]"));
     }
 
@@ -651,6 +692,7 @@ mod tests {
             r"C:\out.mp4",
             2.0,
             "cut",
+            1.5,
             "remove",
             None,
         )

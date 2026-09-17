@@ -10,7 +10,7 @@ It is built as a small Tauri 2 desktop app so it can run on a typical 5–6 year
 - Playback with speed from 0.1x to 2.0x in 0.1 steps
 - Trim start and end on a timeline
 - Keep, remove, or replace the audio track
-- Build a slideshow from a folder of photos (2–30 seconds each, cut / fade / crossfade)
+- Build a slideshow from a folder of photos (2–30 seconds each, cut / fade / crossfade, fade length 0–5s)
 - Save As a new H.264/AAC MP4 (never overwrites the original)
 
 ## Prerequisites

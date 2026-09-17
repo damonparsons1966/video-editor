@@ -166,6 +166,17 @@ button.play {
   justify-content: flex-end;
 }
 
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.stepper strong {
+  min-width: 3.2rem;
+  text-align: center;
+}
+
 .dropzone strong {
   font-size: 1.2rem;
 }
@@ -234,6 +245,11 @@ button.play {
   align-items: center;
   gap: 0.85rem;
   flex-wrap: wrap;
+}
+
+.transport {
+  display: flex;
+  gap: 0.5rem;
 }
 
 .clock {

@@ -234,6 +234,7 @@ async fn export_slideshow(
         &options.output_path,
         options.hold_seconds,
         &options.transition,
+        options.fade_seconds,
         &options.audio_mode,
         replacement,
     )?;
