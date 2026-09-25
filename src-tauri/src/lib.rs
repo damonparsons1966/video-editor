@@ -112,13 +112,12 @@ async fn run_ffmpeg(
     }
 }
 
-#[tauri::command]
-async fn probe_media(app: AppHandle, path: String) -> Result<MediaInfo, String> {
+async fn ffmpeg_probe(app: &AppHandle, path: &str) -> Result<MediaInfo, String> {
     let (mut rx, _child) = app
         .shell()
         .sidecar("ffmpeg")
         .map_err(|e| e.to_string())?
-        .args(["-hide_banner", "-i", &path])
+        .args(["-hide_banner", "-i", path])
         .spawn()
         .map_err(|e| format!("Could not start FFmpeg: {e}"))?;
 
@@ -133,9 +132,23 @@ async fn probe_media(app: AppHandle, path: String) -> Result<MediaInfo, String> 
         }
     }
 
-    let info = parse_ffmpeg_probe(&text);
+    Ok(parse_ffmpeg_probe(&text))
+}
+
+#[tauri::command]
+async fn probe_media(app: AppHandle, path: String) -> Result<MediaInfo, String> {
+    let info = ffmpeg_probe(&app, &path).await?;
     if !info.has_video {
         return Err("This file does not look like a playable video.".into());
+    }
+    Ok(info)
+}
+
+#[tauri::command]
+async fn probe_audio(app: AppHandle, path: String) -> Result<MediaInfo, String> {
+    let info = ffmpeg_probe(&app, &path).await?;
+    if !info.has_audio {
+        return Err("This file does not look like a playable audio track.".into());
     }
     Ok(info)
 }
@@ -237,6 +250,8 @@ async fn export_slideshow(
         options.fade_seconds,
         &options.audio_mode,
         replacement,
+        &options.overlays,
+        options.base_volume,
     )?;
 
     let result = run_ffmpeg(
@@ -283,6 +298,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             probe_media,
+            probe_audio,
             prepare_preview,
             list_slideshow_images,
             export_slideshow,

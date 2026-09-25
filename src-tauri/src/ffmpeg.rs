@@ -17,6 +17,44 @@ pub struct ExportOptions {
     pub audio_mode: String,
     pub replacement_audio_path: Option<String>,
     pub has_source_audio: bool,
+    #[serde(default)]
+    pub overlays: Vec<AudioOverlay>,
+    #[serde(default = "default_volume_percent")]
+    pub base_volume: f64,
+}
+
+pub const MAX_AUDIO_OVERLAYS: usize = 8;
+
+fn default_volume_percent() -> f64 {
+    100.0
+}
+
+pub fn volume_gain(percent: f64) -> Result<f64, String> {
+    let rounded = ((percent / 5.0).round() * 5.0).clamp(5.0, 100.0);
+    if (percent - rounded).abs() > 0.001 {
+        return Err("Volume must be between 5% and 100% in 5% steps.".into());
+    }
+    Ok(rounded / 100.0)
+}
+
+fn volume_filter(percent: f64) -> Result<String, String> {
+    let gain = volume_gain(percent)?;
+    if (gain - 1.0).abs() < 0.001 {
+        return Ok(String::new());
+    }
+    Ok(format!("volume={gain:.2}"))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioOverlay {
+    pub path: String,
+    pub start_seconds: f64,
+    pub fade_in: f64,
+    pub fade_out: f64,
+    pub duration: Option<f64>,
+    #[serde(default = "default_volume_percent")]
+    pub volume: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -187,6 +225,108 @@ pub fn parse_progress_seconds(chunk: &str) -> Option<f64> {
     None
 }
 
+pub fn validate_overlays(overlays: &[AudioOverlay]) -> Result<(), String> {
+    if overlays.len() > MAX_AUDIO_OVERLAYS {
+        return Err(format!(
+            "This project has too many extra audio tracks. Use {MAX_AUDIO_OVERLAYS} or fewer."
+        ));
+    }
+    for overlay in overlays {
+        if overlay.path.trim().is_empty() {
+            return Err("Choose an audio file to add.".into());
+        }
+        if overlay.start_seconds < 0.0 {
+            return Err("Audio start time cannot be negative.".into());
+        }
+        parse_fade_seconds(overlay.fade_in)?;
+        parse_fade_seconds(overlay.fade_out)?;
+        volume_gain(overlay.volume)?;
+    }
+    Ok(())
+}
+
+pub fn overlay_audio_filter(
+    input_index: usize,
+    overlay: &AudioOverlay,
+    output_duration: f64,
+    label: &str,
+) -> String {
+    let start = overlay.start_seconds.max(0.0);
+    let fade_in = round_fade(overlay.fade_in);
+    let fade_out = round_fade(overlay.fade_out);
+    let file_dur = overlay
+        .duration
+        .filter(|value| *value > 0.0)
+        .unwrap_or(output_duration);
+    let usable = file_dur.min((output_duration - start).max(0.0)).max(0.05);
+    let fade_in = fade_in.min(usable);
+    let fade_out = fade_out.min((usable - fade_in).max(0.0));
+    let fade_out_at = (usable - fade_out).max(0.0);
+    let delay_ms = (start * 1000.0).round().max(0.0) as i64;
+
+    let mut chain = format!(
+        "[{input_index}:a]aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={usable:.3},asetpts=PTS-STARTPTS"
+    );
+    if fade_in > 0.05 {
+        chain.push_str(&format!(",afade=t=in:st=0:d={fade_in:.3}"));
+    }
+    if fade_out > 0.05 {
+        chain.push_str(&format!(",afade=t=out:st={fade_out_at:.3}:d={fade_out:.3}"));
+    }
+    if delay_ms > 0 {
+        chain.push_str(&format!(",adelay={delay_ms}:all=1"));
+    }
+    if let Ok(volume) = volume_filter(overlay.volume) {
+        if !volume.is_empty() {
+            chain.push(',');
+            chain.push_str(&volume);
+        }
+    }
+    chain.push_str(&format!(",apad=whole_dur={output_duration:.3}[{label}]"));
+    chain
+}
+
+pub fn mix_audio_labels(labels: &[String]) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    if labels.len() == 1 {
+        return format!("[{}]anull[a]", labels[0]);
+    }
+    let mut graph = String::new();
+    for label in labels {
+        graph.push_str(&format!("[{label}]"));
+    }
+    graph.push_str(&format!(
+        "amix=inputs={}:duration=first:dropout_transition=0:normalize=0[a]",
+        labels.len()
+    ));
+    graph
+}
+
+fn base_audio_filter(
+    source: &str,
+    tempo: &str,
+    output_duration: f64,
+    volume_percent: f64,
+) -> Result<String, String> {
+    let mut chain = format!("[{source}]");
+    if !tempo.is_empty() {
+        chain.push_str(tempo);
+        chain.push(',');
+    }
+    chain.push_str(&format!(
+        "aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={output_duration:.3},apad=whole_dur={output_duration:.3},asetpts=PTS-STARTPTS"
+    ));
+    let volume = volume_filter(volume_percent)?;
+    if !volume.is_empty() {
+        chain.push(',');
+        chain.push_str(&volume);
+    }
+    chain.push_str("[base]");
+    Ok(chain)
+}
+
 pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
     if opts.input_path.trim().is_empty() {
         return Err("Choose a video before saving.".into());
@@ -224,6 +364,9 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
         opts.input_path.clone(),
     ];
 
+    validate_overlays(&opts.overlays)?;
+    volume_gain(opts.base_volume)?;
+
     if audio_mode == "replace" {
         let replacement = opts
             .replacement_audio_path
@@ -233,6 +376,9 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
             .ok_or_else(|| "Choose an audio file to replace the original track.".to_string())?;
         args.extend(["-i".into(), replacement.to_string()]);
     }
+    for overlay in &opts.overlays {
+        args.extend(["-i".into(), overlay.path.clone()]);
+    }
 
     let video_filter = if (speed - 1.0).abs() < 0.001 {
         "null".to_string()
@@ -240,59 +386,99 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
         format!("setpts=PTS/{speed}")
     };
 
-    match audio_mode {
-        "remove" => {
+    let wants_base = match audio_mode {
+        "replace" => true,
+        "keep" => opts.has_source_audio,
+        "remove" => false,
+        other => return Err(format!("Unknown audio mode: {other}")),
+    };
+    let wants_audio = wants_base || !opts.overlays.is_empty();
+    let overlay_start_index = if audio_mode == "replace" { 2 } else { 1 };
+
+    if !wants_audio {
+        args.extend(["-filter:v".into(), video_filter, "-an".into()]);
+    } else if opts.overlays.is_empty() && audio_mode == "replace" {
+        let audio_filter = format!(
+            "atrim=duration={output_duration:.3},apad=whole_dur={output_duration:.3},asetpts=PTS-STARTPTS"
+        );
+        args.extend([
+            "-filter_complex".into(),
+            format!("[0:v]{video_filter}[v];[1:a]{audio_filter}[a]"),
+            "-map".into(),
+            "[v]".into(),
+            "-map".into(),
+            "[a]".into(),
+        ]);
+    } else if opts.overlays.is_empty() && audio_mode == "keep" && opts.has_source_audio {
+        let tempos = atempo_chain(speed);
+        if tempos.is_empty() {
             args.extend([
                 "-filter:v".into(),
                 video_filter,
-                "-an".into(),
+                "-map".into(),
+                "0:v:0".into(),
+                "-map".into(),
+                "0:a:0?".into(),
             ]);
-        }
-        "replace" => {
-            let audio_filter = format!(
-                "atrim=duration={output_duration:.3},apad=whole_dur={output_duration:.3},asetpts=PTS-STARTPTS"
-            );
+        } else {
+            let audio_filter = tempos
+                .iter()
+                .map(|t| format!("atempo={}", fmt_tempo(*t)))
+                .collect::<Vec<_>>()
+                .join(",");
             args.extend([
                 "-filter_complex".into(),
-                format!("[0:v]{video_filter}[v];[1:a]{audio_filter}[a]"),
+                format!("[0:v]{video_filter}[v];[0:a]{audio_filter}[a]"),
                 "-map".into(),
                 "[v]".into(),
                 "-map".into(),
                 "[a]".into(),
             ]);
         }
-        "keep" => {
-            if opts.has_source_audio {
-                let tempos = atempo_chain(speed);
-                if tempos.is_empty() {
-                    args.extend([
-                        "-filter:v".into(),
-                        video_filter,
-                        "-map".into(),
-                        "0:v:0".into(),
-                        "-map".into(),
-                        "0:a:0?".into(),
-                    ]);
-                } else {
-                    let audio_filter = tempos
-                        .iter()
-                        .map(|t| format!("atempo={}", fmt_tempo(*t)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    args.extend([
-                        "-filter_complex".into(),
-                        format!("[0:v]{video_filter}[v];[0:a]{audio_filter}[a]"),
-                        "-map".into(),
-                        "[v]".into(),
-                        "-map".into(),
-                        "[a]".into(),
-                    ]);
-                }
+    } else {
+        let mut graph = format!("[0:v]{video_filter}[v]");
+        let mut labels = Vec::new();
+        if wants_base {
+            let tempo = atempo_chain(speed)
+                .iter()
+                .map(|t| format!("atempo={}", fmt_tempo(*t)))
+                .collect::<Vec<_>>()
+                .join(",");
+            let source = if audio_mode == "replace" { "1:a" } else { "0:a" };
+            let tempo = if audio_mode == "replace" {
+                String::new()
             } else {
-                args.extend(["-filter:v".into(), video_filter, "-an".into()]);
-            }
+                tempo
+            };
+            graph.push(';');
+            graph.push_str(&base_audio_filter(
+                source,
+                &tempo,
+                output_duration,
+                opts.base_volume,
+            )?);
+            labels.push("base".into());
         }
-        other => return Err(format!("Unknown audio mode: {other}")),
+        for (index, overlay) in opts.overlays.iter().enumerate() {
+            graph.push(';');
+            graph.push_str(&overlay_audio_filter(
+                overlay_start_index + index,
+                overlay,
+                output_duration,
+                &format!("o{index}"),
+            ));
+            labels.push(format!("o{index}"));
+        }
+        graph.push(';');
+        graph.push_str(&mix_audio_labels(&labels));
+        args.extend([
+            "-filter_complex".into(),
+            graph,
+            "-map".into(),
+            "[v]".into(),
+            "-map".into(),
+            "[a]".into(),
+        ]);
     }
 
     args.extend([
@@ -310,7 +496,7 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
         "+faststart".into(),
     ]);
 
-    if audio_mode != "remove" && (audio_mode == "replace" || opts.has_source_audio) {
+    if wants_audio {
         args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
     }
 
@@ -347,6 +533,10 @@ pub struct SlideshowOptions {
     pub fade_seconds: f64,
     pub audio_mode: String,
     pub replacement_audio_path: Option<String>,
+    #[serde(default)]
+    pub overlays: Vec<AudioOverlay>,
+    #[serde(default = "default_volume_percent")]
+    pub base_volume: f64,
 }
 
 pub fn round_fade(value: f64) -> f64 {
@@ -463,6 +653,8 @@ pub fn build_slideshow_args(
     fade_seconds: f64,
     audio_mode: &str,
     replacement_audio_path: Option<&str>,
+    overlays: &[AudioOverlay],
+    base_volume: f64,
 ) -> Result<(Vec<String>, f64), String> {
     if staged_names.is_empty() {
         return Err("Choose a folder that contains photos.".into());
@@ -476,6 +668,8 @@ pub fn build_slideshow_args(
         return Err("Choose 2, 5, 10, 20, or 30 seconds per photo.".into());
     }
     let fade = parse_fade_seconds(fade_seconds)?;
+    validate_overlays(overlays)?;
+    volume_gain(base_volume)?;
 
     let duration = slideshow_output_duration(staged_names.len(), hold, transition, fade);
     let input_t = if transition == "crossfade" && effective_fade(fade, hold, transition) > 0.0 {
@@ -504,29 +698,68 @@ pub fn build_slideshow_args(
             .ok_or_else(|| "Choose an audio file to replace the original track.".to_string())?;
         args.extend(["-i".into(), replacement.to_string()]);
     }
+    for overlay in overlays {
+        args.extend(["-i".into(), overlay.path.clone()]);
+    }
 
     let filter = build_slideshow_filter(staged_names.len(), hold, transition, fade)?;
-    args.extend([
-        "-filter_complex".into(),
-        filter.trim().replace('\n', ""),
-        "-map".into(),
-        "[vout]".into(),
-    ]);
+    let wants_base = audio_mode == "replace";
+    let wants_audio = wants_base || !overlays.is_empty();
+    let overlay_start_index = if wants_base {
+        staged_names.len() + 1
+    } else {
+        staged_names.len()
+    };
 
-    if audio_mode == "replace" {
-        args.extend(["-map".into(), format!("{}:a:0", staged_names.len())]);
+    if wants_audio {
+        let mut graph = filter.trim().replace('\n', "");
+        let mut labels = Vec::new();
+        if wants_base {
+            graph.push(';');
+            graph.push_str(&base_audio_filter(
+                &format!("{}:a", staged_names.len()),
+                "",
+                duration,
+                base_volume,
+            )?);
+            labels.push("base".into());
+        }
+        for (index, overlay) in overlays.iter().enumerate() {
+            graph.push(';');
+            graph.push_str(&overlay_audio_filter(
+                overlay_start_index + index,
+                overlay,
+                duration,
+                &format!("o{index}"),
+            ));
+            labels.push(format!("o{index}"));
+        }
+        graph.push(';');
+        graph.push_str(&mix_audio_labels(&labels));
         args.extend([
-            "-af".into(),
-            format!("apad=whole_dur={duration:.3}"),
+            "-filter_complex".into(),
+            graph,
+            "-map".into(),
+            "[vout]".into(),
+            "-map".into(),
+            "[a]".into(),
             "-c:a".into(),
             "aac".into(),
             "-b:a".into(),
             "192k".into(),
+            "-t".into(),
+            format!("{duration:.3}"),
         ]);
-        args.extend(["-t".into(), format!("{duration:.3}")]);
     } else {
-        args.push("-an".into());
-        args.extend(["-t".into(), format!("{duration:.3}")]);
+        args.extend([
+            "-filter_complex".into(),
+            filter.trim().replace('\n', ""),
+            "-map".into(),
+            "[vout]".into(),
+            "-an".into(),
+            "-t".into(),
+            format!("{duration:.3}"),
+        ]);
     }
 
     args.extend([
@@ -651,6 +884,8 @@ mod tests {
             audio_mode: "replace".into(),
             replacement_audio_path: Some(r"C:\bed.mp3".into()),
             has_source_audio: true,
+            overlays: Vec::new(),
+            base_volume: 100.0,
         };
         let args = build_ffmpeg_args(&opts).unwrap();
         let joined = args.join(" ");
@@ -695,6 +930,8 @@ mod tests {
             1.5,
             "remove",
             None,
+            &[],
+            100.0,
         )
         .unwrap();
         assert!((duration - 4.0).abs() < 0.001);
@@ -707,5 +944,37 @@ mod tests {
             .unwrap();
         assert!(filter.contains("concat=n=2:v=1:a=0[vout]"));
         assert!(!filter.contains('\n'));
+    }
+
+    #[test]
+    fn layered_voice_is_delayed_and_mixed() {
+        let opts = ExportOptions {
+            input_path: r"C:\in.mp4".into(),
+            output_path: r"C:\out.mp4".into(),
+            trim_start: 0.0,
+            trim_end: 10.0,
+            speed: 1.0,
+            audio_mode: "keep".into(),
+            replacement_audio_path: None,
+            has_source_audio: true,
+            overlays: vec![AudioOverlay {
+                path: r"C:\voice.mp3".into(),
+                start_seconds: 2.0,
+                fade_in: 1.0,
+                fade_out: 0.5,
+                duration: Some(4.0),
+                volume: 100.0,
+            }],
+            base_volume: 25.0,
+        };
+        let args = build_ffmpeg_args(&opts).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("adelay=2000:all=1"));
+        assert!(joined.contains("afade=t=in:st=0:d=1.000"));
+        assert!(joined.contains("afade=t=out:st=3.500:d=0.500"));
+        assert!(joined.contains("volume=0.25"));
+        assert!(joined.contains("amix=inputs=2"));
+        assert!(joined.contains(r"C:\voice.mp3"));
+        assert!(!joined.contains(" -an "));
     }
 }

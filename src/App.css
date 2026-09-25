@@ -294,6 +294,33 @@ button.play {
   gap: 0.5rem;
 }
 
+.overlay-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.overlay-card {
+  background: #181b24;
+  border: 1px solid #2a2f3c;
+  border-radius: 10px;
+  padding: 0.65rem 0.75rem;
+}
+
+.overlay-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.overlay-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem 1.1rem;
+}
+
 .link {
   background: none;
   border: 0;

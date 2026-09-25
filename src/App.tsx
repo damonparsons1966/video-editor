@@ -5,6 +5,19 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import Timeline from "./Timeline";
 import SlideshowPreview from "./SlideshowPreview";
+import AudioOverlays from "./AudioOverlays";
+import {
+  DEFAULT_VOLUME,
+  MAX_AUDIO_OVERLAYS,
+  clampTrackFade,
+  newOverlayId,
+  overlayLocalTime,
+  overlayVolume,
+  roundStart,
+  roundVolume,
+  volumeGain,
+  type OverlayTrack,
+} from "./audioTracks";
 import {
   AUDIO_EXTENSIONS,
   fileNameOf,
@@ -69,8 +82,10 @@ function DropHint({
 export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const overlayAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
   const loadGeneration = useRef(0);
   const usingProxy = useRef(false);
+  const stoppingAtEnd = useRef(false);
   const slideshowClock = useRef({ origin: 0, from: 0 });
 
   const [videoPath, setVideoPath] = useState<string | null>(null);
@@ -90,6 +105,8 @@ export default function App() {
   const [hasSourceAudio, setHasSourceAudio] = useState(true);
   const [replacementPath, setReplacementPath] = useState<string | null>(null);
   const [replacementUrl, setReplacementUrl] = useState<string | null>(null);
+  const [overlays, setOverlays] = useState<OverlayTrack[]>([]);
+  const [baseVolume, setBaseVolume] = useState(DEFAULT_VOLUME);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -112,14 +129,86 @@ export default function App() {
     return outputDuration(trimStart, trimEnd, speed);
   }, [isSlideshow, slideshowLength, trimStart, trimEnd, speed]);
 
+  function previewOutputTime(sourceTime = currentTime): number {
+    if (isSlideshow) {
+      return Math.max(0, sourceTime);
+    }
+    return Math.max(0, (sourceTime - trimStart) / speed);
+  }
+
+  function pauseOverlayAudio() {
+    overlayAudioRefs.current.forEach((audio) => audio.pause());
+  }
+
+  function syncOverlays(outputTime: number, force = false) {
+    overlays.forEach((track) => {
+      const audio = overlayAudioRefs.current.get(track.id);
+      if (!audio) {
+        return;
+      }
+      const local = overlayLocalTime(outputTime, track);
+      audio.volume = overlayVolume(outputTime, track, outDuration);
+      if (local == null) {
+        if (!audio.paused) {
+          audio.pause();
+        }
+        return;
+      }
+      if (force || Math.abs(audio.currentTime - local) > 0.12) {
+        audio.currentTime = local;
+      }
+      if (playing && audio.paused) {
+        void audio.play().catch(() => {
+          // Preview still works without this track.
+        });
+      }
+    });
+  }
+
+  async function playOverlays(outputTime: number) {
+    syncOverlays(outputTime, true);
+    await Promise.all(
+      overlays.map(async (track) => {
+        const audio = overlayAudioRefs.current.get(track.id);
+        if (!audio || overlayLocalTime(outputTime, track) == null) {
+          return;
+        }
+        try {
+          await audio.play();
+        } catch {
+          // Preview still works without this track.
+        }
+      }),
+    );
+  }
+
   function pausePlayback() {
     videoRef.current?.pause();
     audioRef.current?.pause();
+    pauseOverlayAudio();
     setPlaying(false);
+  }
+
+  function rangeEndTime() {
+    const mediaDuration = videoRef.current?.duration || duration;
+    const end = Math.min(trimEnd, mediaDuration);
+    return Math.max(trimStart, end - 0.05);
+  }
+
+  function stopAtRangeEnd() {
+    stoppingAtEnd.current = true;
+    pausePlayback();
+    const video = videoRef.current;
+    const pin = rangeEndTime();
+    if (video && Number.isFinite(pin)) {
+      video.currentTime = pin;
+    }
+    setCurrentTime(pin);
   }
 
   function resetEditor() {
     pausePlayback();
+    stoppingAtEnd.current = false;
     usingProxy.current = false;
     setError(null);
     setVideoPath(null);
@@ -133,6 +222,8 @@ export default function App() {
     setSpeed(1);
     setReplacementPath(null);
     setReplacementUrl(null);
+    setOverlays([]);
+    setBaseVolume(DEFAULT_VOLUME);
     setPreparingPreview(false);
   }
 
@@ -293,6 +384,79 @@ export default function App() {
     }
   }
 
+  async function addOverlayTrack() {
+    if (overlays.length >= MAX_AUDIO_OVERLAYS) {
+      setError(`Use ${MAX_AUDIO_OVERLAYS} or fewer extra audio tracks.`);
+      return;
+    }
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "Audio", extensions: [...AUDIO_EXTENSIONS] }],
+    });
+    if (typeof selected !== "string") {
+      return;
+    }
+    if (!isAudioPath(selected)) {
+      setError("Use an MP3, WAV, M4A, or AAC audio file.");
+      return;
+    }
+    let durationSecs: number | null = null;
+    try {
+      const info = await invoke<MediaInfo>("probe_audio", { path: selected });
+      if (info.duration && Number.isFinite(info.duration)) {
+        durationSecs = info.duration;
+      }
+    } catch {
+      durationSecs = null;
+    }
+    setError(null);
+    setOverlays((current) => [
+      ...current,
+      {
+        id: newOverlayId(),
+        path: selected,
+        duration: durationSecs,
+        startSeconds: 0,
+        fadeIn: 0,
+        fadeOut: 0,
+        volume: DEFAULT_VOLUME,
+      },
+    ]);
+  }
+
+  function updateOverlay(id: string, patch: Partial<OverlayTrack>) {
+    setOverlays((current) =>
+      current.map((track) => {
+        if (track.id !== id) {
+          return track;
+        }
+        const next = { ...track, ...patch };
+        next.startSeconds = roundStart(next.startSeconds, Math.max(0, outDuration - 0.1));
+        next.fadeIn = clampTrackFade(next.fadeIn);
+        next.fadeOut = clampTrackFade(next.fadeOut);
+        next.volume = roundVolume(next.volume);
+        return next;
+      }),
+    );
+  }
+
+  function removeOverlay(id: string) {
+    overlayAudioRefs.current.get(id)?.pause();
+    overlayAudioRefs.current.delete(id);
+    setOverlays((current) => current.filter((track) => track.id !== id));
+  }
+
+  function serializedOverlays() {
+    return overlays.map((track) => ({
+      path: track.path,
+      startSeconds: track.startSeconds,
+      fadeIn: track.fadeIn,
+      fadeOut: track.fadeOut,
+      duration: track.duration,
+      volume: track.volume,
+    }));
+  }
+
   function setMode(mode: AudioMode) {
     if (mode === "keep" && isSlideshow) {
       return;
@@ -327,6 +491,7 @@ export default function App() {
           // Preview still works without audio.
         }
       }
+      await playOverlays(startAt);
       setPlaying(true);
       return;
     }
@@ -341,6 +506,7 @@ export default function App() {
       return;
     }
 
+    stoppingAtEnd.current = false;
     if (video.currentTime < trimStart || video.currentTime >= trimEnd - 0.04) {
       video.currentTime = trimStart;
       setCurrentTime(trimStart);
@@ -358,6 +524,7 @@ export default function App() {
         );
         await audioRef.current.play();
       }
+      await playOverlays(previewOutputTime(video.currentTime));
       setPlaying(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not play this file.");
@@ -366,6 +533,7 @@ export default function App() {
   }
 
   function seekTo(time: number) {
+    stoppingAtEnd.current = false;
     if (isSlideshow) {
       const clamped = Math.min(Math.max(time, 0), Math.max(0, slideshowLength - 0.01));
       setCurrentTime(clamped);
@@ -373,6 +541,7 @@ export default function App() {
       if (audioRef.current && audioMode === "replace") {
         audioRef.current.currentTime = clamped;
       }
+      syncOverlays(clamped, true);
       return;
     }
     const video = videoRef.current;
@@ -383,6 +552,7 @@ export default function App() {
     video.currentTime = clamped;
     setCurrentTime(clamped);
     syncReplacementAudio(true);
+    syncOverlays(previewOutputTime(clamped), true);
   }
 
   function changeSpeed(next: number) {
@@ -444,6 +614,8 @@ export default function App() {
             fadeSeconds,
             audioMode,
             replacementAudioPath: replacementPath,
+            overlays: serializedOverlays(),
+            baseVolume,
           },
         });
         setExportPercent(100);
@@ -493,6 +665,8 @@ export default function App() {
           audioMode,
           replacementAudioPath: replacementPath,
           hasSourceAudio,
+          overlays: serializedOverlays(),
+          baseVolume,
         },
       });
       setExportPercent(100);
@@ -516,8 +690,12 @@ export default function App() {
     if (video) {
       video.playbackRate = speed;
       video.muted = audioMode !== "keep";
+      video.volume = audioMode === "keep" ? volumeGain(baseVolume) : 1;
     }
-  }, [speed, audioMode, videoUrl]);
+    if (audioRef.current) {
+      audioRef.current.volume = volumeGain(baseVolume);
+    }
+  }, [speed, audioMode, videoUrl, baseVolume]);
 
   useEffect(() => {
     if (!isSlideshow) {
@@ -544,6 +722,7 @@ export default function App() {
       if (next >= slideshowLength) {
         setCurrentTime(slideshowLength);
         audioRef.current?.pause();
+        pauseOverlayAudio();
         setPlaying(false);
         return;
       }
@@ -554,11 +733,12 @@ export default function App() {
           audioRef.current.currentTime = next;
         }
       }
+      syncOverlays(next);
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [isSlideshow, playing, slideshowLength, audioMode]);
+  }, [isSlideshow, playing, slideshowLength, audioMode, overlays, outDuration]);
 
   useEffect(() => {
     let unlistenProgress: (() => void) | undefined;
@@ -690,23 +870,40 @@ export default function App() {
                   }
                 }}
                 onTimeUpdate={(event) => {
+                  if (stoppingAtEnd.current) {
+                    return;
+                  }
                   const time = event.currentTarget.currentTime;
+                  const mediaEnd = event.currentTarget.duration;
+                  const reachedEnd =
+                    time >= trimEnd - 0.04 ||
+                    (Number.isFinite(mediaEnd) && mediaEnd > 0 && time >= mediaEnd - 0.04);
+                  if (reachedEnd) {
+                    stopAtRangeEnd();
+                    return;
+                  }
                   if (time < trimStart) {
                     event.currentTarget.currentTime = trimStart;
                     setCurrentTime(trimStart);
                     return;
                   }
-                  if (time >= trimEnd) {
-                    event.currentTarget.currentTime = trimEnd;
-                    setCurrentTime(trimEnd);
-                    pausePlayback();
-                    return;
-                  }
                   setCurrentTime(time);
                   syncReplacementAudio();
+                  syncOverlays(previewOutputTime(time));
                 }}
-                onPlay={() => setPlaying(true)}
-                onPause={() => setPlaying(false)}
+                onEnded={() => stopAtRangeEnd()}
+                onPlay={(event) => {
+                  if (stoppingAtEnd.current) {
+                    event.currentTarget.pause();
+                    return;
+                  }
+                  setPlaying(true);
+                }}
+                onPause={() => {
+                  if (!stoppingAtEnd.current) {
+                    setPlaying(false);
+                  }
+                }}
                 onError={() =>
                   setError("This video could not be previewed. Try another MP4, MOV, or WebM file.")
                 }
@@ -718,6 +915,21 @@ export default function App() {
               src={replacementUrl ?? undefined}
               preload="auto"
             />
+            {overlays.map((track) => (
+              <audio
+                key={track.id}
+                className="hidden-audio"
+                src={convertFileSrc(track.path)}
+                preload="auto"
+                ref={(element) => {
+                  if (element) {
+                    overlayAudioRefs.current.set(track.id, element);
+                  } else {
+                    overlayAudioRefs.current.delete(track.id);
+                  }
+                }}
+              />
+            ))}
           </div>
 
           {isSlideshow ? (
@@ -908,6 +1120,18 @@ export default function App() {
               </span>
             )}
           </div>
+
+          <AudioOverlays
+            tracks={overlays}
+            outputDuration={outDuration}
+            existingVolume={baseVolume}
+            hasExisting={audioMode === "replace" || (audioMode === "keep" && hasSourceAudio)}
+            disabled={exporting || preparingPreview}
+            onAdd={() => void addOverlayTrack()}
+            onExistingVolume={setBaseVolume}
+            onChange={updateOverlay}
+            onRemove={removeOverlay}
+          />
         </section>
       ) : (
         <DropHint
