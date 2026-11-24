@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -24,9 +24,12 @@ import {
   formatClock,
   isAudioPath,
   isVideoPath,
+  MAX_SPEED,
   MIN_CLIP_SECONDS,
+  MIN_SPEED,
   outputDuration,
   roundSpeed,
+  SPEED_STEP,
   stemOf,
   VIDEO_EXTENSIONS,
 } from "./media";
@@ -53,6 +56,10 @@ type MediaInfo = {
   videoCodec: string | null;
   previewable: boolean;
 };
+
+function mediaUrl(path: string) {
+  return invoke<string>("media_url", { path });
+}
 
 function DropHint({
   dragging,
@@ -84,12 +91,19 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const overlayAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
   const loadGeneration = useRef(0);
+  const mediaJobActive = useRef(false);
   const usingProxy = useRef(false);
+  const playReverseWhenReady = useRef(false);
   const stoppingAtEnd = useRef(false);
   const slideshowClock = useRef({ origin: 0, from: 0 });
 
   const [videoPath, setVideoPath] = useState<string | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [reversePreview, setReversePreview] = useState<{
+    url: string;
+    start: number;
+    end: number;
+  } | null>(null);
   const [slideshowFolder, setSlideshowFolder] = useState<string | null>(null);
   const [slideshowImages, setSlideshowImages] = useState<string[]>([]);
   const [holdSeconds, setHoldSeconds] = useState<HoldSeconds>(5);
@@ -116,6 +130,23 @@ export default function App() {
 
   const isSlideshow = slideshowImages.length > 0;
   const hasProject = Boolean(videoPath || isSlideshow);
+  const reverseActive = speed <= 0 && reversePreview !== null
+    && reversePreview.start === trimStart && reversePreview.end === trimEnd;
+  const previewUrl = reverseActive ? reversePreview.url : videoUrl;
+  const jobsBusy = preparingPreview || exporting;
+
+  useEffect(() => {
+    mediaJobActive.current = jobsBusy;
+  }, [jobsBusy]);
+
+  function sourceTimeOf(mediaTime: number) {
+    return reverseActive ? trimEnd - mediaTime : mediaTime;
+  }
+
+  function seekVideo(video: HTMLVideoElement, sourceTime: number) {
+    const time = reverseActive ? trimEnd - sourceTime : sourceTime;
+    video.currentTime = Math.max(0, Math.min(time, video.duration || duration));
+  }
 
   const slideshowLength = useMemo(
     () => slideshowDuration(slideshowImages.length, holdSeconds, transition, fadeSeconds),
@@ -133,7 +164,11 @@ export default function App() {
     if (isSlideshow) {
       return Math.max(0, sourceTime);
     }
-    return Math.max(0, (sourceTime - trimStart) / speed);
+    if (speed === 0) {
+      return 0;
+    }
+    const elapsed = speed < 0 ? trimEnd - sourceTime : sourceTime - trimStart;
+    return Math.max(0, elapsed / Math.abs(speed));
   }
 
   function pauseOverlayAudio() {
@@ -189,19 +224,13 @@ export default function App() {
     setPlaying(false);
   }
 
-  function rangeEndTime() {
-    const mediaDuration = videoRef.current?.duration || duration;
-    const end = Math.min(trimEnd, mediaDuration);
-    return Math.max(trimStart, end - 0.05);
-  }
-
   function stopAtRangeEnd() {
     stoppingAtEnd.current = true;
     pausePlayback();
+    const pin = reverseActive ? trimStart : Math.max(trimStart, trimEnd - 0.001);
     const video = videoRef.current;
-    const pin = rangeEndTime();
-    if (video && Number.isFinite(pin)) {
-      video.currentTime = pin;
+    if (video) {
+      seekVideo(video, pin);
     }
     setCurrentTime(pin);
   }
@@ -210,9 +239,11 @@ export default function App() {
     pausePlayback();
     stoppingAtEnd.current = false;
     usingProxy.current = false;
+    playReverseWhenReady.current = false;
     setError(null);
     setVideoPath(null);
     setVideoUrl(null);
+    setReversePreview(null);
     setSlideshowFolder(null);
     setSlideshowImages([]);
     setCurrentTime(0);
@@ -227,14 +258,12 @@ export default function App() {
     setPreparingPreview(false);
   }
 
-  function syncReplacementAudio(force = false) {
+  function syncReplacementAudio(force = false, time = currentTime) {
     const audio = audioRef.current;
     if (!audio || audioMode !== "replace") {
       return;
     }
-    const target = isSlideshow
-      ? Math.max(0, currentTime)
-      : Math.max(0, ((videoRef.current?.currentTime ?? currentTime) - trimStart) / speed);
+    const target = Math.min(previewOutputTime(time), audio.duration || Infinity);
     if (force || Math.abs(audio.currentTime - target) > 0.12) {
       audio.currentTime = target;
     }
@@ -249,17 +278,50 @@ export default function App() {
         path,
         duration: durationSecs,
       });
+      const url = await mediaUrl(proxyPath);
       if (generation !== loadGeneration.current) {
         return;
       }
       usingProxy.current = true;
-      setVideoUrl(convertFileSrc(proxyPath));
+      setVideoUrl(url);
     } catch (cause) {
       if (generation !== loadGeneration.current) {
         return;
       }
       const message = typeof cause === "string" ? cause : "Could not prepare a preview.";
       if (message !== "Preview cancelled.") {
+        setError(message);
+      }
+    } finally {
+      if (generation === loadGeneration.current) {
+        setPreparingPreview(false);
+      }
+    }
+  }
+
+  async function makeReversePreview(path: string) {
+    const generation = loadGeneration.current;
+    setPreparingPreview(true);
+    setPreviewPercent(0);
+    setError(null);
+    try {
+      const file = await invoke<string>("prepare_reverse_preview", {
+        path,
+        trimStart,
+        trimEnd,
+        hasSourceAudio,
+      });
+      const url = await mediaUrl(file);
+      if (generation === loadGeneration.current) {
+        playReverseWhenReady.current = true;
+        if (currentTime <= trimStart + 0.01) {
+          setCurrentTime(trimEnd);
+        }
+        setReversePreview({ url, start: trimStart, end: trimEnd });
+      }
+    } catch (cause) {
+      const message = typeof cause === "string" ? cause : "Could not prepare a reverse preview.";
+      if (generation === loadGeneration.current && message !== "Preview cancelled.") {
         setError(message);
       }
     } finally {
@@ -291,17 +353,18 @@ export default function App() {
         setDuration(info.duration);
         setTrimEnd(info.duration);
       }
-      if (info.previewable) {
-        setVideoUrl(convertFileSrc(path));
-      } else {
+      if (!info.previewable) {
         await makePreview(path, info.duration, generation);
-      }
-    } catch (cause) {
-      if (generation !== loadGeneration.current) {
         return;
       }
-      console.warn("probe_media failed", cause);
-      setVideoUrl(convertFileSrc(path));
+      const url = await mediaUrl(path);
+      if (generation === loadGeneration.current) {
+        setVideoUrl(url);
+      }
+    } catch (cause) {
+      if (generation === loadGeneration.current) {
+        setError(typeof cause === "string" ? cause : "Could not open this video.");
+      }
     }
   }
 
@@ -375,12 +438,17 @@ export default function App() {
       setError("Use an MP3, WAV, M4A, or AAC audio file.");
       return;
     }
-    setError(null);
-    setReplacementPath(selected);
-    setReplacementUrl(convertFileSrc(selected));
-    setAudioMode("replace");
-    if (videoRef.current) {
-      videoRef.current.muted = true;
+    try {
+      const url = await mediaUrl(selected);
+      setError(null);
+      setReplacementPath(selected);
+      setReplacementUrl(url);
+      setAudioMode("replace");
+      if (videoRef.current) {
+        videoRef.current.muted = true;
+      }
+    } catch (cause) {
+      setError(typeof cause === "string" ? cause : "Could not open this audio file.");
     }
   }
 
@@ -400,28 +468,29 @@ export default function App() {
       setError("Use an MP3, WAV, M4A, or AAC audio file.");
       return;
     }
-    let durationSecs: number | null = null;
     try {
-      const info = await invoke<MediaInfo>("probe_audio", { path: selected });
-      if (info.duration && Number.isFinite(info.duration)) {
-        durationSecs = info.duration;
-      }
-    } catch {
-      durationSecs = null;
+      const [info, url] = await Promise.all([
+        invoke<MediaInfo>("probe_audio", { path: selected }),
+        mediaUrl(selected),
+      ]);
+      const durationSecs = info.duration && Number.isFinite(info.duration) ? info.duration : null;
+      setError(null);
+      setOverlays((current) => [
+        ...current,
+        {
+          id: newOverlayId(),
+          path: selected,
+          url,
+          duration: durationSecs,
+          startSeconds: 0,
+          fadeIn: 0,
+          fadeOut: 0,
+          volume: DEFAULT_VOLUME,
+        },
+      ]);
+    } catch (cause) {
+      setError(typeof cause === "string" ? cause : "Could not open this audio file.");
     }
-    setError(null);
-    setOverlays((current) => [
-      ...current,
-      {
-        id: newOverlayId(),
-        path: selected,
-        duration: durationSecs,
-        startSeconds: 0,
-        fadeIn: 0,
-        fadeOut: 0,
-        volume: DEFAULT_VOLUME,
-      },
-    ]);
   }
 
   function updateOverlay(id: string, patch: Partial<OverlayTrack>) {
@@ -475,6 +544,9 @@ export default function App() {
   }
 
   async function togglePlay() {
+    if (jobsBusy || (!isSlideshow && speed === 0)) {
+      return;
+    }
     if (isSlideshow) {
       if (playing) {
         pausePlayback();
@@ -497,35 +569,44 @@ export default function App() {
     }
 
     const video = videoRef.current;
-    if (!video || duration <= 0) {
+    if (duration <= 0) {
       return;
     }
-
-    if (!video.paused) {
+    if (video && !video.paused) {
       pausePlayback();
+      return;
+    }
+    if (speed < 0 && !reverseActive && videoPath) {
+      await makeReversePreview(videoPath);
+      return;
+    }
+    if (!video || video.readyState < HTMLMediaElement.HAVE_METADATA) {
       return;
     }
 
     stoppingAtEnd.current = false;
-    if (video.currentTime < trimStart || video.currentTime >= trimEnd - 0.04) {
-      video.currentTime = trimStart;
-      setCurrentTime(trimStart);
+    let time = sourceTimeOf(video.currentTime);
+    if (time < trimStart || time > trimEnd || (reverseActive
+      ? time <= trimStart + 0.01
+      : time >= trimEnd - 0.01)) {
+      time = reverseActive ? trimEnd : trimStart;
+      seekVideo(video, time);
+      setCurrentTime(time);
     }
 
-    video.playbackRate = speed;
+    video.playbackRate = Math.abs(speed);
     video.muted = audioMode !== "keep";
-
+    const outputTime = previewOutputTime(time);
     try {
-      await video.play();
+      const startVideo = video.play();
       if (audioMode === "replace" && audioRef.current) {
-        audioRef.current.currentTime = Math.max(
-          0,
-          (video.currentTime - trimStart) / speed,
-        );
-        await audioRef.current.play();
+        const audio = audioRef.current;
+        audio.currentTime = Math.min(outputTime, audio.duration || Infinity);
+        void audio.play().catch(() => {
+          // The video can still play if the audio is unavailable.
+        });
       }
-      await playOverlays(previewOutputTime(video.currentTime));
-      setPlaying(true);
+      await Promise.all([startVideo, playOverlays(outputTime)]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not play this file.");
       pausePlayback();
@@ -548,20 +629,24 @@ export default function App() {
     if (!video) {
       return;
     }
-    const clamped = Math.min(Math.max(time, trimStart), Math.max(trimStart, trimEnd - 0.01));
-    video.currentTime = clamped;
+    const clamped = Math.min(Math.max(time, trimStart), trimEnd);
+    seekVideo(video, clamped);
     setCurrentTime(clamped);
-    syncReplacementAudio(true);
+    syncReplacementAudio(true, clamped);
     syncOverlays(previewOutputTime(clamped), true);
   }
 
   function changeSpeed(next: number) {
     const value = roundSpeed(next);
-    setSpeed(value);
-    if (videoRef.current) {
-      videoRef.current.playbackRate = value;
+    if (value === speed) {
+      return;
     }
-    syncReplacementAudio(true);
+    if (value === 0 || Math.sign(value) !== Math.sign(speed)) {
+      playReverseWhenReady.current = false;
+      pausePlayback();
+      stoppingAtEnd.current = false;
+    }
+    setSpeed(value);
   }
 
   function changeFade(next: number) {
@@ -571,17 +656,29 @@ export default function App() {
   function updateTrimStart(time: number) {
     const next = Math.min(Math.max(0, time), trimEnd - MIN_CLIP_SECONDS);
     setTrimStart(next);
-    seekTo(next);
+    stoppingAtEnd.current = false;
+    if (reverseActive) {
+      pausePlayback();
+    } else if (videoRef.current) {
+      seekVideo(videoRef.current, next);
+    }
+    setCurrentTime(next);
   }
 
   function updateTrimEnd(time: number) {
     const next = Math.max(Math.min(duration, time), trimStart + MIN_CLIP_SECONDS);
     setTrimEnd(next);
-    seekTo(next);
+    stoppingAtEnd.current = false;
+    if (reverseActive) {
+      pausePlayback();
+    } else if (videoRef.current) {
+      seekVideo(videoRef.current, next);
+    }
+    setCurrentTime(next);
   }
 
   async function saveAs() {
-    if (exporting) {
+    if (jobsBusy || (!isSlideshow && speed === 0)) {
       return;
     }
     if (audioMode === "replace" && !replacementPath) {
@@ -644,11 +741,6 @@ export default function App() {
     const outputPath = selectedPath.toLowerCase().endsWith(".mp4")
       ? selectedPath
       : `${selectedPath}.mp4`;
-    if (outputPath.replace(/\//g, "\\").toLowerCase() === videoPath.replace(/\//g, "\\").toLowerCase()) {
-      setError("Choose a new file. The original is never overwritten.");
-      return;
-    }
-
     setError(null);
     setExporting(true);
     setExportPercent(0);
@@ -682,20 +774,19 @@ export default function App() {
 
   async function cancelExport() {
     await invoke("cancel_export");
-    setExporting(false);
   }
 
   useEffect(() => {
     const video = videoRef.current;
     if (video) {
-      video.playbackRate = speed;
+      video.playbackRate = Math.abs(speed) || 1;
       video.muted = audioMode !== "keep";
       video.volume = audioMode === "keep" ? volumeGain(baseVolume) : 1;
     }
     if (audioRef.current) {
       audioRef.current.volume = volumeGain(baseVolume);
     }
-  }, [speed, audioMode, videoUrl, baseVolume]);
+  }, [speed, audioMode, previewUrl, baseVolume]);
 
   useEffect(() => {
     if (!isSlideshow) {
@@ -762,7 +853,7 @@ export default function App() {
           } else if (event.payload.type === "drop") {
             setDragging(false);
             const path = event.payload.paths[0];
-            if (path) {
+            if (path && !mediaJobActive.current) {
               void openDroppedPath(path);
             }
           }
@@ -815,16 +906,16 @@ export default function App() {
           </p>
         </div>
         <div className="topbar-actions">
-          <button type="button" onClick={() => void openVideoDialog()}>
+          <button type="button" disabled={jobsBusy} onClick={() => void openVideoDialog()}>
             Open video…
           </button>
-          <button type="button" onClick={() => void openPhotoFolderDialog()}>
+          <button type="button" disabled={jobsBusy} onClick={() => void openPhotoFolderDialog()}>
             Open photos…
           </button>
           <button
             type="button"
             className="primary"
-            disabled={!hasProject || exporting || preparingPreview}
+            disabled={!hasProject || jobsBusy || (!isSlideshow && speed === 0)}
             onClick={() => void saveAs()}
           >
             Save As…
@@ -843,70 +934,65 @@ export default function App() {
                 fadeSeconds={fadeSeconds}
                 currentTime={currentTime}
               />
-            ) : videoUrl ? (
+            ) : previewUrl ? (
               <video
+                key={previewUrl}
                 ref={videoRef}
-                src={videoUrl}
+                src={previewUrl}
                 playsInline
                 preload="auto"
                 onLoadedMetadata={(event) => {
-                  const clip = event.currentTarget.duration || 0;
-                  setDuration(clip);
-                  setTrimStart(0);
-                  setTrimEnd(clip);
-                  event.currentTarget.playbackRate = speed;
-                  if (clip > 0) {
-                    event.currentTarget.currentTime = 0.001;
+                  const video = event.currentTarget;
+                  const clip = video.duration;
+                  const fullSource = !usingProxy.current && trimStart === 0 && trimEnd === duration;
+                  if (!reverseActive && Number.isFinite(clip) && (duration <= 0 || fullSource)) {
+                    setDuration(clip);
+                    setTrimEnd(clip);
                   }
+                  seekVideo(video, currentTime);
                 }}
                 onLoadedData={(event) => {
-                  if (
-                    event.currentTarget.videoWidth === 0 &&
-                    videoPath &&
-                    !usingProxy.current &&
-                    !preparingPreview
-                  ) {
+                  if (event.currentTarget.videoWidth === 0 && videoPath
+                    && !reverseActive && !usingProxy.current && !jobsBusy) {
                     void makePreview(videoPath, duration || null, loadGeneration.current);
+                  }
+                }}
+                onCanPlay={() => {
+                  if (reverseActive && playReverseWhenReady.current) {
+                    playReverseWhenReady.current = false;
+                    void togglePlay();
                   }
                 }}
                 onTimeUpdate={(event) => {
                   if (stoppingAtEnd.current) {
                     return;
                   }
-                  const time = event.currentTarget.currentTime;
-                  const mediaEnd = event.currentTarget.duration;
-                  const reachedEnd =
-                    time >= trimEnd - 0.04 ||
-                    (Number.isFinite(mediaEnd) && mediaEnd > 0 && time >= mediaEnd - 0.04);
-                  if (reachedEnd) {
+                  const time = sourceTimeOf(event.currentTarget.currentTime);
+                  if (!event.currentTarget.paused
+                    && (reverseActive ? time <= trimStart : time >= trimEnd)) {
                     stopAtRangeEnd();
                     return;
                   }
-                  if (time < trimStart) {
-                    event.currentTarget.currentTime = trimStart;
-                    setCurrentTime(trimStart);
-                    return;
+                  setCurrentTime(Math.min(trimEnd, Math.max(trimStart, time)));
+                  if (speed !== 0) {
+                    syncReplacementAudio(false, time);
+                    syncOverlays(previewOutputTime(time));
                   }
-                  setCurrentTime(time);
-                  syncReplacementAudio();
-                  syncOverlays(previewOutputTime(time));
                 }}
-                onEnded={() => stopAtRangeEnd()}
-                onPlay={(event) => {
-                  if (stoppingAtEnd.current) {
-                    event.currentTarget.pause();
-                    return;
-                  }
-                  setPlaying(true);
-                }}
+                onEnded={stopAtRangeEnd}
+                onPlay={() => setPlaying(true)}
                 onPause={() => {
-                  if (!stoppingAtEnd.current) {
-                    setPlaying(false);
+                  audioRef.current?.pause();
+                  pauseOverlayAudio();
+                  setPlaying(false);
+                }}
+                onError={() => {
+                  if (videoPath && !reverseActive && !usingProxy.current && !jobsBusy) {
+                    void makePreview(videoPath, duration || null, loadGeneration.current);
+                  } else {
+                    setError("This video could not be previewed.");
                   }
                 }}
-                onError={() =>
-                  setError("This video could not be previewed. Try another MP4, MOV, or WebM file.")
-                }
               />
             ) : null}
             <audio
@@ -919,7 +1005,7 @@ export default function App() {
               <audio
                 key={track.id}
                 className="hidden-audio"
-                src={convertFileSrc(track.path)}
+                src={track.url}
                 preload="auto"
                 ref={(element) => {
                   if (element) {
@@ -974,15 +1060,15 @@ export default function App() {
             <div className="transport">
               <button
                 type="button"
-                disabled={(!videoUrl && !isSlideshow) || preparingPreview}
-                onClick={() => seekTo(isSlideshow ? 0 : trimStart)}
+                disabled={(!previewUrl && !isSlideshow) || jobsBusy}
+                onClick={() => seekTo(isSlideshow ? 0 : speed < 0 ? trimEnd : trimStart)}
               >
                 Start
               </button>
               <button
                 type="button"
                 className="play"
-                disabled={(!videoUrl && !isSlideshow) || preparingPreview}
+                disabled={jobsBusy || (!isSlideshow && (speed === 0 || (!previewUrl && speed > 0)))}
                 onClick={() => void togglePlay()}
               >
                 {playing ? "Pause" : "Play"}
@@ -1018,11 +1104,21 @@ export default function App() {
             ) : (
               <div className="speed">
                 <span>Speed</span>
-                <button type="button" onClick={() => changeSpeed(speed - 0.1)}>
+                <button
+                  type="button"
+                  aria-label="Decrease speed"
+                  disabled={jobsBusy || speed <= MIN_SPEED}
+                  onClick={() => changeSpeed(speed - SPEED_STEP)}
+                >
                   −
                 </button>
                 <strong>{speed.toFixed(1)}x</strong>
-                <button type="button" onClick={() => changeSpeed(speed + 0.1)}>
+                <button
+                  type="button"
+                  aria-label="Increase speed"
+                  disabled={jobsBusy || speed >= MAX_SPEED}
+                  onClick={() => changeSpeed(speed + SPEED_STEP)}
+                >
                   +
                 </button>
               </div>
@@ -1147,17 +1243,14 @@ export default function App() {
         <div className="export-overlay">
           <div className="export-card">
             <h2>Preparing preview…</h2>
-            <p className="muted">This file needs a lightweight H.264 copy so it can be shown here.</p>
+            <p className="muted">Creating a lightweight copy for playback.</p>
             <div className="progress">
               <div className="progress-bar" style={{ width: `${previewPercent}%` }} />
             </div>
             <p>{previewPercent}%</p>
             <button
               type="button"
-              onClick={() => {
-                void invoke("cancel_export");
-                setPreparingPreview(false);
-              }}
+              onClick={() => void invoke("cancel_export")}
             >
               Cancel
             </button>

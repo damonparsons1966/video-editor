@@ -1,9 +1,34 @@
 const MIN_CLIP_SECS: f64 = 0.1;
 
-fn normalize_path(path: &str) -> String {
-    path.replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
+pub fn same_file(left: &str, right: &str) -> bool {
+    use std::fs::metadata;
+    use std::os::unix::fs::MetadataExt;
+
+    if left == right {
+        return true;
+    }
+    match (metadata(left), metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+pub fn validated_speed(speed: f64) -> Result<f64, String> {
+    let rounded = (speed * 10.0).round() / 10.0;
+    if (0.1..=2.0).contains(&rounded.abs()) {
+        Ok(rounded)
+    } else {
+        Err("Choose a speed from -2.0x to 2.0x other than 0.0x.".into())
+    }
+}
+
+pub fn trim_duration(start: f64, end: f64) -> Result<f64, String> {
+    let length = end - start;
+    if start >= 0.0 && end.is_finite() && length >= MIN_CLIP_SECS - 1e-9 {
+        Ok(length)
+    } else {
+        Err("Choose a trim range of at least 0.1 seconds.".into())
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -90,7 +115,10 @@ pub fn atempo_chain(speed: f64) -> Vec<f64> {
 }
 
 fn fmt_tempo(value: f64) -> String {
-    format!("{value:.4}").trim_end_matches('0').trim_end_matches('.').to_string()
+    format!("{value:.4}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 pub fn parse_video_codec(stderr: &str) -> Option<String> {
@@ -138,7 +166,10 @@ pub fn parse_ffmpeg_probe(stderr: &str) -> MediaInfo {
     }
 }
 
-pub fn preview_cache_path(source: &str) -> Result<std::path::PathBuf, String> {
+pub fn preview_cache_path(
+    source: &str,
+    cache: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::time::UNIX_EPOCH;
@@ -149,10 +180,10 @@ pub fn preview_cache_path(source: &str) -> Result<std::path::PathBuf, String> {
     meta.len().hash(&mut hasher);
     if let Ok(modified) = meta.modified() {
         if let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) {
-            elapsed.as_secs().hash(&mut hasher);
+            elapsed.hash(&mut hasher);
         }
     }
-    let dir = std::env::temp_dir().join("video-editor-previews");
+    let dir = cache.join("previews");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join(format!("{:x}.mp4", hasher.finish())))
 }
@@ -334,35 +365,29 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
     if opts.output_path.trim().is_empty() {
         return Err("Choose where to save the new MP4.".into());
     }
-    if normalize_path(&opts.input_path) == normalize_path(&opts.output_path) {
+    if same_file(&opts.input_path, &opts.output_path) {
         return Err("Choose a new file. The original is never overwritten.".into());
     }
 
-    let speed = (opts.speed * 10.0).round() / 10.0;
-    if !(0.1..=2.0).contains(&speed) {
-        return Err("Speed must be between 0.1x and 2.0x.".into());
+    let speed = validated_speed(opts.speed)?;
+    if speed < 0.0 {
+        return Err("Reverse the source before encoding it.".into());
     }
-
-    let start = opts.trim_start.max(0.0);
-    let end = opts.trim_end;
-    if end - start < MIN_CLIP_SECS {
-        return Err("Trim range is too short.".into());
-    }
-
-    let source_duration = end - start;
+    let start = opts.trim_start;
+    let source_duration = trim_duration(start, opts.trim_end)?;
     let output_duration = source_duration / speed;
     let audio_mode = opts.audio_mode.as_str();
 
-    let mut args = vec![
-        "-hide_banner".into(),
-        "-y".into(),
-        "-ss".into(),
-        format!("{start:.3}"),
+    let mut args = vec!["-hide_banner".into(), "-y".into()];
+    if start > 0.0 {
+        args.extend(["-ss".into(), format!("{start:.6}")]);
+    }
+    args.extend([
         "-t".into(),
-        format!("{source_duration:.3}"),
+        format!("{source_duration:.6}"),
         "-i".into(),
         opts.input_path.clone(),
-    ];
+    ]);
 
     validate_overlays(&opts.overlays)?;
     volume_gain(opts.base_volume)?;
@@ -397,44 +422,6 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
 
     if !wants_audio {
         args.extend(["-filter:v".into(), video_filter, "-an".into()]);
-    } else if opts.overlays.is_empty() && audio_mode == "replace" {
-        let audio_filter = format!(
-            "atrim=duration={output_duration:.3},apad=whole_dur={output_duration:.3},asetpts=PTS-STARTPTS"
-        );
-        args.extend([
-            "-filter_complex".into(),
-            format!("[0:v]{video_filter}[v];[1:a]{audio_filter}[a]"),
-            "-map".into(),
-            "[v]".into(),
-            "-map".into(),
-            "[a]".into(),
-        ]);
-    } else if opts.overlays.is_empty() && audio_mode == "keep" && opts.has_source_audio {
-        let tempos = atempo_chain(speed);
-        if tempos.is_empty() {
-            args.extend([
-                "-filter:v".into(),
-                video_filter,
-                "-map".into(),
-                "0:v:0".into(),
-                "-map".into(),
-                "0:a:0?".into(),
-            ]);
-        } else {
-            let audio_filter = tempos
-                .iter()
-                .map(|t| format!("atempo={}", fmt_tempo(*t)))
-                .collect::<Vec<_>>()
-                .join(",");
-            args.extend([
-                "-filter_complex".into(),
-                format!("[0:v]{video_filter}[v];[0:a]{audio_filter}[a]"),
-                "-map".into(),
-                "[v]".into(),
-                "-map".into(),
-                "[a]".into(),
-            ]);
-        }
     } else {
         let mut graph = format!("[0:v]{video_filter}[v]");
         let mut labels = Vec::new();
@@ -444,7 +431,11 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
                 .map(|t| format!("atempo={}", fmt_tempo(*t)))
                 .collect::<Vec<_>>()
                 .join(",");
-            let source = if audio_mode == "replace" { "1:a" } else { "0:a" };
+            let source = if audio_mode == "replace" {
+                "1:a"
+            } else {
+                "0:a"
+            };
             let tempo = if audio_mode == "replace" {
                 String::new()
             } else {
@@ -510,9 +501,67 @@ pub fn build_ffmpeg_args(opts: &ExportOptions) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+// Reverse one short interval at a time so FFmpeg never buffers the full trim.
+pub fn reverse_segment_args(
+    input: &str,
+    output: &str,
+    start: f64,
+    length: f64,
+    include_audio: bool,
+    preview: bool,
+) -> Vec<String> {
+    let scale = if preview {
+        "scale=trunc(min(960\\,iw)/2)*2:-2,"
+    } else {
+        ""
+    };
+    let video = format!(
+        "{scale}fps=30,tpad=stop_mode=clone:stop_duration=2,trim=duration={length:.6},reverse"
+    );
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-ss".into(),
+        format!("{start:.6}"),
+        "-t".into(),
+        format!("{length:.6}"),
+        "-i".into(),
+        input.into(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-vf".into(),
+        video,
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "ultrafast".into(),
+        "-crf".into(),
+        if preview { "23" } else { "0" }.into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+    ];
+    if include_audio {
+        args.extend([
+            "-map".into(),
+            "0:a:0".into(),
+            "-af".into(),
+            format!("aresample=48000:async=1:first_pts=0,apad,atrim=duration={length:.6},areverse"),
+            "-ac".into(),
+            "2".into(),
+            "-c:a".into(),
+            "pcm_s16le".into(),
+        ]);
+    }
+    args.extend([
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
+        output.into(),
+    ]);
+    args
+}
+
 pub fn output_duration(opts: &ExportOptions) -> f64 {
-    let speed = (opts.speed * 10.0).round() / 10.0;
-    ((opts.trim_end - opts.trim_start).max(MIN_CLIP_SECS)) / speed.max(0.1)
+    (opts.trim_end - opts.trim_start) / opts.speed.abs()
 }
 
 pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
@@ -828,6 +877,16 @@ pub fn list_image_files(folder: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_speed_accepts_both_directions_but_rejects_pause() {
+        assert_eq!(validated_speed(-2.0).unwrap(), -2.0);
+        assert_eq!(validated_speed(-0.1).unwrap(), -0.1);
+        assert_eq!(validated_speed(0.1).unwrap(), 0.1);
+        assert_eq!(validated_speed(2.0).unwrap(), 2.0);
+        assert!(validated_speed(0.0).is_err());
+        assert!(validated_speed(-2.1).is_err());
+    }
 
     #[test]
     fn atempo_identity() {

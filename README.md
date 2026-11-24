@@ -1,45 +1,49 @@
 # Video Editor
 
-A lightweight Windows 10+ editor. Open an MP4, MOV, or WebM file, trim it, change speed, replace or remove audio, then Save As a new MP4. You can also build a 1080p slideshow from a folder of photos.
+A lightweight Ubuntu desktop editor built with Tauri 2, React, and FFmpeg.
 
-It is built as a small Tauri 2 desktop app so it can run on a typical 5–6 year old laptop. Chromium cannot preview HEVC (common on phones); the app builds a temporary H.264 preview for playback and still exports from the original file.
+- Open or drag in an MP4, MOV, or WebM video and trim the start and end.
+- Set playback and export speed from −2.0× to +2.0× in 0.1× steps. Negative speeds play the trim range backwards. At 0.0× the preview is paused and Save As is disabled.
+- Keep, remove, or replace the original audio. Add up to eight audio overlays with independent start times, fades, and volume.
+- Build a 1080p slideshow from a photo folder with cuts, fades, or crossfades.
+- Save a new H.264/AAC MP4 while preserving the source video.
 
-## Features
+The first time you press **Play** at a negative speed, the editor generates a lower-resolution reverse preview for the selected trim range. It reuses the preview while the range stays the same. Kept source audio reverses with the video. Replacement audio and overlays play forward. Reverse exports use the original video at 30 frames per second. They process short segments to limit memory use and need temporary disk space next to the output.
 
-- Open or drag-and-drop MP4, MOV, WebM
-- Playback with speed from 0.1x to 2.0x in 0.1 steps
-- Trim start and end on a timeline
-- Keep, remove, or replace the audio track
-- Layer extra audio tracks on top (start time, fade in/out, volume) and turn the existing track down to 5%
-- Build a slideshow from a folder of photos (2–30 seconds each, cut / fade / crossfade, fade length 0–5s)
-- Save As a new H.264/AAC MP4 (never overwrites the original)
+## Install on Ubuntu
 
-## Prerequisites
+For a package built on this Ubuntu release and CPU architecture, run the following from the package’s folder and substitute the actual filename.
 
-- Windows 10 or later (WebView2 is included)
-- [Node.js](https://nodejs.org/) 20+
-- [Rust](https://www.rust-lang.org/tools/install) (MSVC toolchain)
-- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload
-
-## Setup
-
-```powershell
-npm install
-powershell -ExecutionPolicy Bypass -File .\scripts\fetch-ffmpeg.ps1
+```bash
+sudo apt install './Video Editor_0.1.0_amd64.deb'
 ```
 
-The fetch script places `ffmpeg.exe` at `src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe`. That file is not in git (it is over GitHub’s 100 MB limit).
+Launch **Video Editor** from the applications menu. The package uses Ubuntu’s FFmpeg and installs the required playback dependencies through APT.
 
-## Run
+## Build from source
 
-```powershell
+Use Node.js 22.12 or later with npm. Install stable Rust and Cargo with [rustup](https://rust-lang.org/install/) if `cargo --version` fails. After installing Rust, open a new terminal or run `source "$HOME/.cargo/env"` in your current terminal.
+
+From the project folder, install Ubuntu's native build and playback dependencies and the project's Node dependencies.
+
+```bash
+sudo apt update
+sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev ffmpeg gstreamer1.0-libav gstreamer1.0-plugins-good
+npm ci
+```
+
+Run the application in development mode.
+
+```bash
 npm run tauri dev
 ```
 
-## Build an installer
+Build the Debian package for the current architecture.
 
-```powershell
+```bash
 npm run tauri build
 ```
 
-The NSIS installer is written under `src-tauri\target\release\bundle\nsis\`. After installing, launch **Video Editor** from the Start menu.
+The installer is written to `src-tauri/target/release/bundle/deb/`. Build on the oldest Ubuntu release you intend to support.
+
+The last Windows version is preserved in Git at commit `d787975`.

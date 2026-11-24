@@ -10,6 +10,7 @@ export const DEFAULT_VOLUME = 100;
 export type OverlayTrack = {
   id: string;
   path: string;
+  url: string;
   duration: number | null;
   startSeconds: number;
   fadeIn: number;

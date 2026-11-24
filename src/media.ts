@@ -1,5 +1,5 @@
 export const MIN_CLIP_SECONDS = 0.1;
-export const MIN_SPEED = 0.1;
+export const MIN_SPEED = -2.0;
 export const MAX_SPEED = 2.0;
 export const SPEED_STEP = 0.1;
 
@@ -7,13 +7,13 @@ export const VIDEO_EXTENSIONS = ["mp4", "mov", "webm"] as const;
 export const AUDIO_EXTENSIONS = ["mp3", "wav", "m4a", "aac"] as const;
 
 export function extensionOf(path: string): string {
-  const base = path.replace(/\\/g, "/").split("/").pop() ?? "";
+  const base = path.split("/").pop() ?? "";
   const dot = base.lastIndexOf(".");
   return dot >= 0 ? base.slice(dot + 1).toLowerCase() : "";
 }
 
 export function fileNameOf(path: string): string {
-  return path.replace(/\\/g, "/").split("/").pop() ?? path;
+  return path.split("/").pop() ?? path;
 }
 
 export function stemOf(path: string): string {
@@ -32,7 +32,7 @@ export function isAudioPath(path: string): boolean {
 
 export function roundSpeed(value: number): number {
   const rounded = Math.round(value * 10) / 10;
-  return Math.min(MAX_SPEED, Math.max(MIN_SPEED, rounded));
+  return Math.min(MAX_SPEED, Math.max(MIN_SPEED, rounded)) || 0;
 }
 
 export function formatClock(seconds: number): string {
@@ -56,5 +56,5 @@ export function outputDuration(
   trimEnd: number,
   speed: number,
 ): number {
-  return Math.max(0, (trimEnd - trimStart) / Math.max(speed, MIN_SPEED));
+  return speed === 0 ? 0 : Math.max(0, (trimEnd - trimStart) / Math.abs(speed));
 }
